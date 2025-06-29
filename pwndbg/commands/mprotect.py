@@ -2,30 +2,23 @@ from __future__ import annotations
 
 import argparse
 
+import pwndbg.aglib.file
+import pwndbg.aglib.shellcode
 import pwndbg.chain
 import pwndbg.commands
 import pwndbg.enhance
-import pwndbg.gdblib.file
-import pwndbg.gdblib.shellcode
 import pwndbg.lib.memory
 import pwndbg.wrappers.checksec
 import pwndbg.wrappers.readelf
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
     description="""
 Calls the mprotect syscall and prints its result value.
 
 Note that the mprotect syscall may fail for various reasons
 (see `man mprotect`) and a non-zero error return value
 can be decoded with the `errno <value>` command.
-
-Examples:
-    mprotect $rsp 4096 PROT_READ|PROT_WRITE|PROT_EXEC
-    mprotect $rsp 4096 rwx
-    mprotect $rsp 4096 7
-    mprotect some_symbol 0x1000 PROT_NONE
 """,
 )
 parser.add_argument(
@@ -91,18 +84,30 @@ def prot_val_to_str(protval: int) -> str:
     return "|".join(ret)
 
 
-@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.MEMORY)
+@pwndbg.commands.Command(
+    parser,
+    category=CommandCategory.MEMORY,
+    examples="""
+mprotect $rsp 4096 PROT_READ|PROT_WRITE|PROT_EXEC
+mprotect $rsp 4096 rwx
+mprotect $rsp 4096 7
+mprotect some_symbol 0x1000 PROT_NONE
+""",
+)
 @pwndbg.commands.OnlyWhenRunning
 def mprotect(addr, length, prot) -> None:
     prot_int = prot_str_to_val(prot)
     orig_addr = int(addr)
     aligned = pwndbg.lib.memory.page_align(orig_addr)
 
-    print(
-        f"calling mprotect on address {aligned:#x} with protection {prot_int} ({prot_val_to_str(prot_int)})"
-    )
+    async def ctrl(ec: pwndbg.dbg_mod.ExecutionController):
+        print(
+            f"calling mprotect on address {aligned:#x} with protection {prot_int} ({prot_val_to_str(prot_int)})"
+        )
 
-    ret = pwndbg.gdblib.shellcode.exec_syscall(
-        "SYS_mprotect", aligned, int(length) + orig_addr - aligned, int(prot_int)
-    )
-    print(f"mprotect returned {ret}")
+        ret = await pwndbg.aglib.shellcode.exec_syscall(
+            ec, "SYS_mprotect", aligned, int(length) + orig_addr - aligned, int(prot_int)
+        )
+        print(f"mprotect returned {ret}")
+
+    pwndbg.dbg.selected_inferior().dispatch_execution_controller(ctrl)

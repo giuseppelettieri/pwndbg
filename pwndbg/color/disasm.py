@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
+import pwndbg.aglib.nearpc
 import pwndbg.aglib.regs
 import pwndbg.chain
 import pwndbg.color.context as C
@@ -12,6 +13,7 @@ from pwndbg.color import ColorConfig
 from pwndbg.color import ColorParamSpec
 from pwndbg.color import ljust_colored
 from pwndbg.color import strip
+from pwndbg.color.message import off
 from pwndbg.color.message import on
 
 c = ColorConfig(
@@ -40,8 +42,10 @@ def one_instruction(ins: PwndbgInstruction) -> str:
     # If we know the conditional is taken, mark it as taken.
     if ins.condition == InstructionCondition.TRUE or ins.is_conditional_jump_taken:
         asm = on("✔ ") + asm
+    elif ins.condition == InstructionCondition.FALSE:
+        asm = off("✘ ") + asm
     else:
-        asm = "  " + asm
+        asm = f"  {asm}"
 
     return asm
 
@@ -80,7 +84,7 @@ def instructions_and_padding(instructions: List[PwndbgInstruction]) -> List[str]
                 current_group = []
         else:
             if ins.syscall is not None:
-                asm += f" <{pwndbg.gdblib.nearpc.c.syscall_name('SYS_' + ins.syscall_name)}>"
+                asm += f" <{pwndbg.aglib.nearpc.c.syscall_name('SYS_' + ins.syscall_name)}>"
 
             # Padding the string for a nicer output
             # This path calculates the padding for each instruction - even if there we don't have annotations for it.

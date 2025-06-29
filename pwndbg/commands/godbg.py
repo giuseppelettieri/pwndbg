@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import argparse
 
-import pwndbg.aglib.arch
+import pwndbg.aglib.godbg
 import pwndbg.commands
-import pwndbg.gdblib.config
-import pwndbg.gdblib.godbg
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.regs
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(
@@ -47,7 +43,7 @@ parser.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(
+@pwndbg.commands.Command(
     parser, category=CommandCategory.MEMORY, command_name="go-dump", aliases=["god"]
 )
 @pwndbg.commands.OnlyWhenRunning
@@ -56,13 +52,13 @@ def go_dump(
 ) -> None:
     try:
         ty_addr = int(ty, 0)
-        (_, parsed_ty) = pwndbg.gdblib.godbg.decode_runtime_type(ty_addr)
+        (_, parsed_ty) = pwndbg.aglib.godbg.decode_runtime_type(ty_addr)
         if parsed_ty is None:
             print("Failed to decode runtime type.")
             return
     except ValueError:
-        parsed_ty = pwndbg.gdblib.godbg.parse_type(ty)
-    fmt = pwndbg.gdblib.godbg.FormatOpts(
+        parsed_ty = pwndbg.aglib.godbg.parse_type(ty)
+    fmt = pwndbg.aglib.godbg.FormatOpts(
         int_hex=hex, float_decimals=decimals, debug=debug, pretty=pretty
     )
     print(parsed_ty.dump(address, fmt))
@@ -78,12 +74,12 @@ parser.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(
+@pwndbg.commands.Command(
     parser, category=CommandCategory.MEMORY, command_name="go-type", aliases=["goty"]
 )
 @pwndbg.commands.OnlyWhenRunning
 def go_type(address: int) -> None:
-    meta, ty = pwndbg.gdblib.godbg.decode_runtime_type(address, True)
+    meta, ty = pwndbg.aglib.godbg.decode_runtime_type(address, True)
     print(f" Name: {meta.name}")
     print(f" Kind: {meta.kind.name}")
     print(f" Size: {meta.size} ({meta.size:#x})")

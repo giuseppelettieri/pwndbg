@@ -16,48 +16,61 @@ from typing import List
 import gdb
 
 import pwndbg
+import pwndbg.aglib.nearpc
+import pwndbg.aglib.regs
 import pwndbg.color.message as M
 import pwndbg.commands
+import pwndbg.commands.context
+import pwndbg.commands.telescope
+import pwndbg.ghidra
 import pwndbg.lib.strings
-from pwndbg import config
 from pwndbg.commands import CommandCategory
-from pwndbg.commands import context
-from pwndbg.gdblib import regs as REGS
 
-config.add_param(
+pwndbg.config.add_param(
     "ai-openai-api-key",
     "",
-    "OpenAI API key (will default to OPENAI_API_KEY environment variable if not set)",
+    "OpenAI API key",
+    help_docstring="Will default to OPENAI_API_KEY environment variable if not set.",
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-anthropic-api-key",
     "",
-    "Anthropic API key (will default to ANTHROPIC_API_KEY environment variable if not set)",
+    "Anthropic API key",
+    help_docstring="Defaults to ANTHROPIC_API_KEY environment variable if not set.",
 )
-config.add_param(
+pwndbg.config.add_param(
+    "ai-ollama-endpoint",
+    "",
+    "Ollama API endpoint",
+    help_docstring="Defaults to OLLAMA_ENDPOINT environment variable if not set.",
+)
+pwndbg.config.add_param(
     "ai-history-size",
     3,
-    "maximum number of successive questions and answers to maintain in the prompt for the ai command",
+    "maximum number of questions and answers to keep in the prompt",
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-stack-depth", 16, "rows of stack context to include in the prompt for the ai command"
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-model",
     "gpt-3.5-turbo",  # the new conversational model
-    "the name of the OpenAI large language model to query (see <https://platform.openai.com/docs/models> for details)",
+    "the name of the large language model to query",
+    help_docstring="Changing this affects the behavior, response quality, and cost (if applicable) of AI responses.",
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-temperature",
     0,
-    "the temperature specification for the LLM query (this controls the degree of randomness in the response -- see <https://beta.openai.com/docs/api-reference/parameters> for details)",
+    "the temperature specification for the LLM query",
+    help_docstring="This controls the degree of randomness in the response.",
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-max-tokens",
     100,
-    "the maximum number of tokens to return in the response (see <https://beta.openai.com/docs/api-reference/parameters> for details)",
+    "the maximum number of tokens to return in the response",
+    help_docstring="Useful when limiting verbosity or conserving resources. Set to a lower value to restrict output.",
 )
-config.add_param(
+pwndbg.config.add_param(
     "ai-show-usage",
     False,
     "whether to show how many tokens are used with each OpenAI API call",
@@ -85,27 +98,39 @@ def set_dummy_mode(d=True) -> None:
 
 
 def get_openai_api_key():
-    if config.ai_openai_api_key.value:
-        return config.ai_openai_api_key.value
+    if pwndbg.config.ai_openai_api_key.value:
+        return pwndbg.config.ai_openai_api_key.value
     key = os.environ.get("OPENAI_API_KEY", "")
     if key:
         print(M.warn("Setting OpenAI API key from OPENAI_API_KEY environment variable."))
-        config.ai_openai_api_key.value = key
+        pwndbg.config.ai_openai_api_key.value = key
         return key
     else:
-        return config.ai_openai_api_key.value
+        return pwndbg.config.ai_openai_api_key.value
 
 
 def get_anthropic_api_key():
-    if config.ai_anthropic_api_key.value:
-        return config.ai_anthropic_api_key.value
+    if pwndbg.config.ai_anthropic_api_key.value:
+        return pwndbg.config.ai_anthropic_api_key.value
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key:
         print(M.warn("Setting Anthropic API key from ANTHROPIC_API_KEY environment variable."))
-        config.ai_anthropic_api_key.value = key
+        pwndbg.config.ai_anthropic_api_key.value = key
         return key
     else:
-        return config.ai_anthropic_api_key.value
+        return pwndbg.config.ai_anthropic_api_key.value
+
+
+def get_ollama_endpoint():
+    if pwndbg.config.ai_ollama_endpoint.value:
+        return pwndbg.config.ai_ollama_endpoint.value
+    endpoint = os.environ.get("OLLAMA_ENDPOINT", "")
+    if endpoint:
+        print(M.warn("Setting Ollama Endpoint from OLLAMA_ENDPOINT environment variable."))
+        pwndbg.config.ai_ollama_endpoint.value = endpoint
+        return endpoint
+    else:
+        return pwndbg.config.ai_ollama_endpoint.value
 
 
 def build_prompt(question, command=None):
@@ -150,13 +175,13 @@ def build_context_prompt_body():
     ## First, get the current GDB context
     ## Let's begin with the assembly near the current instruction
     try:
-        asm_rows = pwndbg.gdblib.nearpc.nearpc(emulate=True, lines=16)
+        asm_rows = pwndbg.aglib.nearpc.nearpc(emulate=True, lines=16)
         asm = "\n".join(asm_rows)
     except Exception as e:
         print(M.error(f"Error: {e}"))
         asm = gdb.execute("x/16i $pc", to_string=True)
     ## Next, let's get the registers
-    regs_rows = context.get_regs()
+    regs_rows = pwndbg.commands.context.get_regs()
     regs = "\n".join(regs_rows)
     flags = None
     try:
@@ -169,9 +194,10 @@ def build_context_prompt_body():
             flags = re.search(r"\[(.*)\]", flags).group(1)
         except Exception:
             pass
+
     ## Finally, let's get the stack
     stack_rows = pwndbg.commands.telescope.telescope(
-        REGS.sp, to_string=True, count=config.ai_stack_depth
+        pwndbg.aglib.regs.sp, to_string=True, count=pwndbg.config.ai_stack_depth
     )
     stack = "\n".join(stack_rows)
     ## and the backtrace
@@ -282,7 +308,7 @@ def query_openai_chat(prompt, model="gpt-3.5-turbo", max_tokens=100, temperature
         url,
         data=json.dumps(data),
         headers={"Content-Type": "application/json"},
-        auth=("Bearer", config.ai_openai_api_key),
+        auth=("Bearer", pwndbg.config.ai_openai_api_key),
     )
     res = r.json()
     if verbosity > 0:
@@ -292,7 +318,7 @@ def query_openai_chat(prompt, model="gpt-3.5-turbo", max_tokens=100, temperature
             error_message = f"{res['error']['message']}: {res['error']['type']}"
             raise Exception(error_message)
         raise Exception(res)
-    if config.ai_show_usage:
+    if pwndbg.config.ai_show_usage:
         print(
             M.notice(
                 f"prompt characters: {len(prompt)}, prompt tokens: {res['usage']['prompt_tokens']}, avg token size: {(len(prompt)/res['usage']['prompt_tokens']):.2f}, completion tokens: {res['usage']['completion_tokens']}, total tokens: {res['usage']['total_tokens']}"
@@ -321,7 +347,7 @@ def query_openai_completions(prompt, model="text-davinci-003", max_tokens=100, t
         url,
         data=json.dumps(data),
         headers={"Content-Type": "application/json"},
-        auth=("Bearer", config.ai_openai_api_key),
+        auth=("Bearer", pwndbg.config.ai_openai_api_key),
     )
     res = r.json()
     if verbosity > 0:
@@ -332,7 +358,7 @@ def query_openai_completions(prompt, model="text-davinci-003", max_tokens=100, t
             raise Exception(error_message)
         raise Exception(res)
     reply = res["choices"][0]["text"]
-    if config.ai_show_usage:
+    if pwndbg.config.ai_show_usage:
         print(
             M.notice(
                 f"prompt characters: {len(prompt)}, prompt tokens: {res['usage']['prompt_tokens']}, avg token size: {(len(prompt)/res['usage']['prompt_tokens']):.2f}, completion tokens: {res['usage']['completion_tokens']}, total tokens: {res['usage']['total_tokens']}"
@@ -344,7 +370,11 @@ def query_openai_completions(prompt, model="text-davinci-003", max_tokens=100, t
 def query(prompt, model="text-davinci-003", max_tokens=100, temperature=0.0):
     if dummy:
         return f"""This is a dummy response for unit testing purposes.\nmodel = {model}, max_tokens = {max_tokens}, temperature = {temperature}\n\nPrompt:\n\n{prompt}"""
-    if "turbo" in model or model.startswith("gpt-4"):
+    if pwndbg.config.ai_ollama_endpoint:
+        if isinstance(prompt, list):
+            prompt = flatten_prompt(prompt)
+        return query_ollama(prompt, model, max_tokens, temperature)
+    elif "turbo" in model or model.startswith("gpt-4"):
         if isinstance(prompt, str):
             prompt = [{"role": "user", "content": prompt}]
         return query_openai_chat(prompt, model, max_tokens, temperature)
@@ -367,7 +397,7 @@ def query_anthropic(prompt, model="claude-v1", max_tokens=100, temperature=0.0):
         "stop_sequences": ["\n\nHuman:"],
     }
     headers = {
-        "x-api-key": config.ai_anthropic_api_key.value,
+        "x-api-key": pwndbg.config.ai_anthropic_api_key.value,
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
     }
@@ -381,9 +411,31 @@ def query_anthropic(prompt, model="claude-v1", max_tokens=100, temperature=0.0):
         return f"Anthropic API error: {data['detail']}"
 
 
+def query_ollama(prompt, model="mistral", max_tokens=100, temperature=0.0):
+    data = {
+        "model": model,
+        "prompt": f"User:\n{prompt}\n",
+        "temperature": temperature,
+        "num_predict": max_tokens,
+        "stop": ["\n\nHuman:"],
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+    url = f"{pwndbg.config.ai_ollama_endpoint.value}/api/generate"
+    response = _requests().post(url, data=json.dumps(data), headers=headers)
+    data = response.json()
+    try:
+        return data["response"].strip()
+    except KeyError:
+        print(M.error(f"Ollama API error: {data}"))
+        return f"Ollama API error: {data['error']}"
+
+
 def get_openai_models():
     url = "https://api.openai.com/v1/models"
-    r = _requests().get(url, auth=("Bearer", config.ai_openai_api_key))
+    r = _requests().get(url, auth=("Bearer", pwndbg.config.ai_openai_api_key))
     res = r.json()
     if verbosity > 0:
         print(M.warn(pprint.pformat(res)))
@@ -415,12 +467,13 @@ parser.add_argument(
 
 
 # @pwndbg.commands.OnlyWhenRunning
-@pwndbg.commands.ArgparsedCommand(parser, command_name="ai", category=CommandCategory.INTEGRATIONS)
+@pwndbg.commands.Command(parser, command_name="ai", category=CommandCategory.INTEGRATIONS)
 def ai(question, model, temperature, max_tokens, verbose, list_models=False, command=None) -> None:
     # print the arguments
     global last_question, last_answer, last_pc, last_command, verbosity
     ai_openai_api_key = get_openai_api_key()
     ai_anthropic_api_key = get_anthropic_api_key()
+    ai_ollama_endpoint = get_ollama_endpoint()
     if list_models:
         models = get_openai_models()
         print(
@@ -432,20 +485,20 @@ def ai(question, model, temperature, max_tokens, verbose, list_models=False, com
             print(M.notice(f"  - {model}"))
         return
 
-    if not (ai_openai_api_key or ai_anthropic_api_key):
+    if not (ai_openai_api_key or ai_anthropic_api_key or ai_ollama_endpoint):
         print(
             M.error(
-                "At least one of the following must be set:\n- ai_openai_api_key config parameter\n- ai_anthropic_api_key config parameter\n- OPENAI_API_KEY environment variable\n- ANTHROPIC_API_KEY environment variable"
+                "At least one of the following must be set:\n- ai_openai_api_key config parameter\n- ai_anthropic_api_key config parameter\n- ai_ollama_endpoint config parameter\n- OPENAI_API_KEY environment variable\n- ANTHROPIC_API_KEY environment variable\n- OLLAMA_ENDPOINT environment variable"
             )
         )
         return
     verbosity = int(verbose)
     if model is None:
-        model = config.ai_model.value
+        model = pwndbg.config.ai_model.value
     if temperature is None:
-        temperature = config.ai_temperature.value
+        temperature = pwndbg.config.ai_temperature.value
     if max_tokens is None:
-        max_tokens = config.ai_max_tokens.value
+        max_tokens = pwndbg.config.ai_max_tokens.value
 
     question = " ".join(question).strip()
     current_pc = gdb.execute("info reg $pc", to_string=True)
@@ -466,7 +519,7 @@ def ai(question, model, temperature, max_tokens, verbose, list_models=False, com
     last_question.append(question)
     last_answer.append(res)
     last_pc = current_pc
-    if len(last_question) > config.ai_history_size:
+    if len(last_question) > pwndbg.config.ai_history_size:
         last_question.pop(0)
         last_answer.pop(0)
 

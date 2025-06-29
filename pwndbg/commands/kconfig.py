@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 
+import pwndbg.aglib.kernel
 import pwndbg.color.message as M
 import pwndbg.commands
-import pwndbg.gdblib.kernel
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(
@@ -14,11 +14,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument("config_name", nargs="?", type=str, help="A config name to search for")
 
 
-@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.KERNEL)
+@pwndbg.commands.Command(parser, category=CommandCategory.KERNEL)
 @pwndbg.commands.OnlyWhenQemuKernel
 @pwndbg.commands.OnlyWhenPagingEnabled
 def kconfig(config_name=None) -> None:
-    kconfig_ = pwndbg.gdblib.kernel.kconfig()
+    kconfig_ = pwndbg.aglib.kernel.kconfig()
 
     if not kconfig_:
         print(

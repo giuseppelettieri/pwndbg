@@ -19,6 +19,7 @@ from elftools.elf.relocation import Relocation
 from typing_extensions import ParamSpec
 
 import pwndbg.aglib.qemu
+import pwndbg.lib.arch
 import pwndbg.lib.cache
 import pwndbg.lib.memory
 
@@ -29,7 +30,6 @@ pid: int
 tid: int
 thread_id: int
 alive: bool
-thread_is_stopped: bool
 stopped_with_signal: bool
 exe: str | None
 binary_base_addr: int
@@ -49,16 +49,10 @@ def OnlyWithArch(
 class module(ModuleType):
     @property
     def pid(self) -> int:
-        # QEMU usermode emulation always returns 42000 for some reason.
-        # In any case, we can't use the info.
-        if pwndbg.aglib.qemu.is_qemu_usermode():
-            return pwndbg.aglib.qemu.pid()
         return pwndbg.dbg.selected_inferior().pid()
 
     @property
     def tid(self) -> int:
-        if pwndbg.aglib.qemu.is_qemu_usermode():
-            return pwndbg.aglib.qemu.pid()
         return pwndbg.dbg.selected_thread().ptid()
 
     @property
@@ -73,6 +67,15 @@ class module(ModuleType):
         using the `stopped_with_signal` method.
         """
         return pwndbg.dbg.selected_inferior().alive()
+
+    @property
+    def stopped_with_signal(self) -> bool:
+        """
+        Returns whether the program has stopped with a signal
+
+        Can be used to detect segfaults (but will also detect other signals)
+        """
+        return pwndbg.dbg.selected_inferior().stopped_with_signal()
 
     @property
     @pwndbg.lib.cache.cache_until("objfile")
@@ -105,18 +108,18 @@ class module(ModuleType):
         """
         Dump .data section of current process's ELF file
         """
-        import pwndbg.gdblib.elf
+        import pwndbg.aglib.elf
 
-        return pwndbg.gdblib.elf.dump_section_by_name(self.exe, ".data", try_local_path=True)
+        return pwndbg.aglib.elf.dump_section_by_name(self.exe, ".data", try_local_path=True)
 
     @pwndbg.lib.cache.cache_until("start", "objfile")
     def dump_relocations_by_section_name(self, section_name: str) -> Tuple[Relocation, ...] | None:
         """
         Dump relocations of a section by section name of current process's ELF file
         """
-        import pwndbg.gdblib.elf
+        import pwndbg.aglib.elf
 
-        return pwndbg.gdblib.elf.dump_relocations_by_section_name(
+        return pwndbg.aglib.elf.dump_relocations_by_section_name(
             self.exe, section_name, try_local_path=True
         )
 
@@ -159,7 +162,7 @@ class module(ModuleType):
     ) -> Callable[[Callable[P, T]], Callable[P, Optional[T]]]:
         """Decorates function to work only with the specified archictectures."""
         for arch in arch_names:
-            if arch not in pwndbg.aglib.arch_mod.ARCHS:
+            if arch not in pwndbg.lib.arch.PWNDBG_SUPPORTED_ARCHITECTURES:
                 raise ValueError(
                     f"OnlyWithArch used with unsupported arch={arch}. Must be one of {', '.join(arch_names)}"
                 )

@@ -6,13 +6,34 @@ Mostly concerns itself with argument completion.
 
 from __future__ import annotations
 
-import gnureadline as readline
+import contextlib
+import functools
+import os.path
+import sys
+from typing import Callable
+from typing import ParamSpec
+from typing import TypeVar
+
+if sys.platform != "win32":
+    import gnureadline as readline
+else:
+    import readline
+
+    # pyreadline3 doesn't implement `set_completion_display_matches_hook`
+    if not hasattr(readline, "set_completion_display_matches_hook"):
+        readline.set_completion_display_matches_hook = lambda *args: None
+
 import lldb
 
 from pwndbg.color import message
 from pwndbg.dbg.lldb import LLDB
 
-PROMPT = message.prompt("pwndbg-lldb> ")
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+PROMPT = message.readline_escape(message.prompt, "pwndbg-lldb> ")
+HISTORY_FILE = os.path.expanduser("~/.pwndbg_history")
 
 complete_values = lldb.SBStringList()
 complete_descrs = lldb.SBStringList()
@@ -61,6 +82,27 @@ def display_completions(substitutions, matches, longest_match_len):
 
     print(PROMPT, end="", flush=True)
     print(readline.get_line_buffer(), end="", flush=True)
+
+
+def wrap_with_history(function: Callable[P, T]) -> Callable[P, T]:
+    @functools.wraps(function)
+    def _wrapped(*a: P.args, **kw: P.kwargs) -> T:
+        with ctx_with_history():
+            return function(*a, **kw)
+
+    return _wrapped
+
+
+@contextlib.contextmanager
+def ctx_with_history():
+    readline.set_history_length(1000)
+    if os.path.exists(HISTORY_FILE):
+        readline.read_history_file(HISTORY_FILE)
+
+    try:
+        yield
+    finally:
+        readline.write_history_file(HISTORY_FILE)
 
 
 def enable_readline(dbg: LLDB):

@@ -1,45 +1,33 @@
 from __future__ import annotations
 
-import argparse
 from typing import Any
+from typing import Optional
 
 import pwndbg
-import pwndbg.color.message as message
 import pwndbg.commands
 import pwndbg.lib.config as cfg
 
-parser = argparse.ArgumentParser(description="Changes a Pwndbg setting.")
-parser.add_argument(
-    "name",
-    type=str,
-    default=None,
-    help="Name of the setting to be changed",
-)
-parser.add_argument(
-    "value",
-    type=str,
-    default=None,
-    help="Value to change the setting into",
-)
+
+def pget(name: str) -> Optional[pwndbg.lib.config.Parameter]:
+    """
+    Retrieves a parameter with a given name.
+    """
+    return pwndbg.config.params.get(name.replace("-", "_"))
 
 
-@pwndbg.commands.ArgparsedCommand(parser)
-def pset(name, value):
-    name = name.replace("-", "_")
-    if name not in pwndbg.config.params:
-        print(message.error(f"Unknown setting '{name}'"))
-        return
+def pset(param: pwndbg.lib.config.Parameter, value: str):
+    """
+    Parses and sets a Pwndbg configuration value.
 
-    param = pwndbg.config.params[name]
-    try:
-        new_value = parse_value(param, value)
-    except InvalidParse:
-        print(message.error("Invalid value '{value}' for setting '{name}': {e.message}"))
-        return
+    Raises `InvalidParse` if the value is not valid.
+    """
+    new_value = parse_value(param, value)
 
     param.value = new_value
     for trigger in pwndbg.config.triggers[param.name]:
         trigger()
+
+    return True
 
 
 class InvalidParse(Exception):

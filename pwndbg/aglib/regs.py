@@ -13,7 +13,9 @@ from typing import Any
 from typing import Callable
 from typing import Dict
 from typing import Generator
+from typing import Iterator
 from typing import List
+from typing import Set
 from typing import Tuple
 from typing import cast
 
@@ -26,6 +28,7 @@ import pwndbg.aglib.typeinfo
 import pwndbg.lib.cache
 from pwndbg.dbg import EventType
 from pwndbg.lib.regs import BitFlags
+from pwndbg.lib.regs import KernelRegisterSet
 from pwndbg.lib.regs import RegisterSet
 from pwndbg.lib.regs import reg_sets
 
@@ -41,13 +44,16 @@ def get_register(
 ) -> pwndbg.dbg_mod.Value | None:
     if frame is None:
         frame = pwndbg.dbg.selected_frame()
-    assert (
-        frame is not None
-    ), "pwndbg.dbg.selected_frame() should never return None when marked with @OnlyWhenRunning"
+        if frame is None:
+            # `read_reg` will return None when it catches this exception. This
+            # mirrors how a `gdb.error` causes `read_reg` to return `None` in
+            # gdblib when no frame is selected.
+            raise pwndbg.dbg_mod.Error("No currently selected frame to read registers from")
 
     regs = regs_in_frame(frame)
 
-    return regs.by_name(name) or regs.by_name(name.upper())
+    value = regs.by_name(name)
+    return value if value is not None else regs.by_name(name.upper())
 
 
 @pwndbg.aglib.proc.OnlyWhenQemuKernel
@@ -125,7 +131,8 @@ class module(ModuleType):
         if attr in ("last", "previous"):
             super().__setattr__(attr, val)
         else:
-            pwndbg.dbg.selected_frame().reg_write(attr, int(val))
+            if not pwndbg.dbg.selected_frame().reg_write(attr, int(val)):
+                raise RuntimeError(f"Attempted to write to a non-existent register '{attr}'")
 
     @pwndbg.lib.cache.cache_until("stop", "prompt")
     def __getitem__(self, item: Any) -> int | None:
@@ -136,12 +143,10 @@ class module(ModuleType):
         return self.read_reg(item)
 
     def __contains__(self, reg: str) -> bool:
-        regs = set(reg_sets[pwndbg.aglib.arch.name]) | {"pc", "sp"}
-        return reg in regs
+        return reg_sets[pwndbg.aglib.arch.name].__contains__(reg)
 
-    def __iter__(self) -> Generator[str, None, None]:
-        regs = set(reg_sets[pwndbg.aglib.arch.name]) | {"pc", "sp"}
-        yield from regs
+    def __iter__(self) -> Iterator[str]:
+        return reg_sets[pwndbg.aglib.arch.name].__iter__()
 
     @property
     def current(self) -> RegisterSet:
@@ -165,6 +170,10 @@ class module(ModuleType):
         return reg_sets[pwndbg.aglib.arch.name].retaddr
 
     @property
+    def kernel(self) -> KernelRegisterSet:
+        return reg_sets[pwndbg.aglib.arch.name].kernel
+
+    @property
     def flags(self) -> Dict[str, BitFlags]:
         return reg_sets[pwndbg.aglib.arch.name].flags
 
@@ -181,31 +190,11 @@ class module(ModuleType):
         return reg_sets[pwndbg.aglib.arch.name].retval
 
     @property
-    def all(self) -> List[str]:
-        regs = reg_sets[pwndbg.aglib.arch.name]
-        retval: List[str] = []
-        for regset in (
-            regs.pc,
-            regs.stack,
-            regs.frame,
-            regs.retaddr,
-            regs.flags,
-            regs.gpr,
-            regs.misc,
-        ):
-            if regset is None:
-                continue
-
-            if isinstance(regset, (list, tuple)):  # regs.retaddr
-                retval.extend(regset)
-            elif isinstance(regset, dict):  # regs.flags
-                retval.extend(regset.keys())
-            else:
-                retval.append(regset)
-        return retval
+    def all(self) -> Set[str]:
+        return reg_sets[pwndbg.aglib.arch.name].all
 
     def fix(self, expression: str) -> str:
-        for regname in set(self.all + ["sp", "pc"]):
+        for regname in self.all:
             expression = re.sub(rf"\$?\b{regname}\b", r"$" + regname, expression)
         return expression
 
@@ -247,7 +236,6 @@ class module(ModuleType):
     def gsbase(self) -> int:
         return self._fs_gs_helper("gs_base", ARCH_GET_GS)
 
-    @pwndbg.lib.cache.cache_until("stop")
     def _fs_gs_helper(self, regname: str, which: int) -> int:
         """Supports fetching based on segmented addressing, a la fs:[0x30].
         Requires ptrace'ing the child directory if i386."""

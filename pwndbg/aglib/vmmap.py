@@ -3,27 +3,27 @@ from __future__ import annotations
 from typing import Tuple
 
 import pwndbg
+import pwndbg.aglib.vmmap_custom
 import pwndbg.lib.cache
 import pwndbg.lib.memory
+from pwndbg.dbg import MemoryMap
 
-if pwndbg.dbg.is_gdblib_available():
-    # The code in pwndbg.gdblib.vmmap does _so much_ more than just getting the
-    # entries of the vmmap. We'll probably have to port it to run on top of the
-    # Debugger-agnostic API, rather than embed its functionality inside it. When
-    # that happens, this file will become that port. For now, we just fall back
-    # on gdblib if possible, and expose weaker versions of these functions when
-    # it's not available.
-    #
-    # TODO: Port `pwndbg.gdblib.vmmap` to `aglib`.
-    import pwndbg.gdblib.vmmap
+pwndbg.config.add_param(
+    "vmmap-prefer-relpaths",
+    True,
+    "show relative paths by default in vmmap",
+    param_class=pwndbg.lib.config.PARAM_BOOLEAN,
+)
+
+
+@pwndbg.lib.cache.cache_until("start", "stop")
+def get_memory_map() -> MemoryMap:
+    return pwndbg.dbg.selected_inferior().vmmap()
 
 
 @pwndbg.lib.cache.cache_until("start", "stop")
 def get() -> Tuple[pwndbg.lib.memory.Page, ...]:
-    if pwndbg.dbg.is_gdblib_available():
-        return pwndbg.gdblib.vmmap.get()
-
-    return tuple(pwndbg.dbg.selected_inferior().vmmap().ranges())
+    return tuple(get_memory_map().ranges())
 
 
 @pwndbg.lib.cache.cache_until("start", "stop")
@@ -32,11 +32,12 @@ def find(address: int | pwndbg.dbg_mod.Value | None) -> pwndbg.lib.memory.Page |
         return None
 
     address = int(address)
+    if address < 0:
+        return None
 
-    for page in get():
-        if address in page:
-            return page
+    page = get_memory_map().lookup_page(address)
 
-    if pwndbg.dbg.is_gdblib_available():
-        return pwndbg.gdblib.vmmap.explore(address)
-    return None
+    if page is not None:
+        return page
+
+    return pwndbg.aglib.vmmap_custom.explore(address)

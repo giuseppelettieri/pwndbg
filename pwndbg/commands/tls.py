@@ -6,17 +6,21 @@ from __future__ import annotations
 
 import argparse
 
-import gdb
 from tabulate import tabulate
 
+import pwndbg.aglib.memory
+import pwndbg.aglib.symbol
+import pwndbg.aglib.tls
+import pwndbg.aglib.vmmap
 import pwndbg.color.memory as M
 import pwndbg.commands
-import pwndbg.gdblib.tls
+import pwndbg.commands.context
+import pwndbg.commands.telescope
+import pwndbg.dbg
 from pwndbg.color import message
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
     description="Print out base address of the current Thread Local Storage (TLS).",
 )
 
@@ -28,20 +32,62 @@ parser.add_argument(
     help="Try to get the address of TLS by calling pthread_self().",
 )
 
+parser.add_argument("-a", "--all", action="store_true", help="Do not truncate the dump output.")
 
-@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.LINUX)
+
+@pwndbg.commands.Command(parser, category=CommandCategory.LINUX)
 @pwndbg.commands.OnlyWhenRunning
 @pwndbg.commands.OnlyWhenUserspace
-def tls(pthread_self=False) -> None:
+def tls(pthread_self=False, all: bool = False) -> None:
     tls_base = (
-        pwndbg.gdblib.tls.find_address_with_register()
+        pwndbg.aglib.tls.find_address_with_register()
         if not pthread_self
-        else pwndbg.gdblib.tls.find_address_with_pthread_self()
+        else pwndbg.aglib.tls.find_address_with_pthread_self()
     )
-    if pwndbg.gdblib.memory.is_readable_address(tls_base):
+    if pwndbg.aglib.memory.is_readable_address(tls_base):
         print(message.success("Thread Local Storage (TLS) base: %#x" % tls_base))
         print(message.success("TLS is located at:"))
-        print(message.notice(pwndbg.gdblib.vmmap.find(tls_base)))
+        print(message.notice(pwndbg.aglib.vmmap.find(tls_base)))
+
+        # Displaying `dt tcbhead_t <tls_base>` if possible
+        # If not, we will dump the tls with telescope
+        output = str(pwndbg.aglib.dt.dt("tcbhead_t", addr=tls_base))
+
+        print(message.success("Dumping the address:"))
+        if output == "Type not found.":
+            pwndbg.commands.telescope.telescope(tls_base, 10)
+        else:
+            lines = output.splitlines()
+
+            if all or len(lines) <= 10:
+                print(message.notice(output))
+            else:
+                index = None
+                for i, line in enumerate(lines):
+                    if "__glibc_unused2" in line:
+                        index = i
+                        break
+
+                if index is not None:
+                    end_index = index + 2
+                    for line in lines[:end_index]:
+                        print(message.notice(line))
+                    print(message.notice("\t[...]"))
+                    print(
+                        message.hint(
+                            "Output truncated. Rerun with option -a to display the full output."
+                        )
+                    )
+                # In case there is a tcbhead_t but there is no __glibc_unused2
+                else:
+                    for line in lines[:10]:
+                        print(message.notice(line))
+                    print(message.notice("\t[...]"))
+                    print(
+                        message.hint(
+                            "Output truncated. Rerun with option -a to display the full output."
+                        )
+                    )
         return
     print(message.error("Couldn't find Thread Local Storage (TLS) base."))
     if not pthread_self:
@@ -54,7 +100,6 @@ def tls(pthread_self=False) -> None:
 
 
 parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
     description="List all threads belonging to the selected inferior.",
 )
 group = parser.add_mutually_exclusive_group()
@@ -76,13 +121,15 @@ group.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.LINUX)
+@pwndbg.commands.Command(parser, category=CommandCategory.LINUX)
 @pwndbg.commands.OnlyWhenRunning
 @pwndbg.commands.OnlyWhenUserspace
 def threads(num_threads, respect_config) -> None:
     table = []
     headers = ["global_num", "name", "status", "pc", "symbol"]
     bold_green = lambda text: pwndbg.color.bold(pwndbg.color.green(text))
+
+    import gdb
 
     try:
         original_thread = gdb.selected_thread()
@@ -130,10 +177,10 @@ def threads(num_threads, respect_config) -> None:
 
         if thread.is_stopped():
             thread.switch()
-            pc = gdb.selected_frame().pc()
+            pc = pwndbg.dbg.selected_frame().pc()
 
             pc_colored = M.get(pc)
-            symbol = pwndbg.gdblib.symbol.get(pc)
+            symbol = pwndbg.aglib.symbol.resolve_addr(pc)
 
             row.append(pc_colored)
 

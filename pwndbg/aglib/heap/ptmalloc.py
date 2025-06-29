@@ -28,6 +28,8 @@ import pwndbg
 import pwndbg.aglib.heap
 import pwndbg.aglib.heap.heap
 import pwndbg.aglib.memory
+import pwndbg.aglib.proc
+import pwndbg.aglib.symbol
 import pwndbg.aglib.tls
 import pwndbg.aglib.typeinfo
 import pwndbg.aglib.vmmap
@@ -452,9 +454,9 @@ class Chunk:
 
     def __contains__(self, addr: int) -> bool:
         """
-        This allow us to avoid extra constructions like 'if strart_addr <= ptr <= end_addr', etc.
+        This allow us to avoid extra constructions like 'if start_addr <= ptr < end_addr', etc.
         """
-        size_field_address = self._gdbValue[self.__match_renamed_field("size")].address
+        size_field_address = int(self._gdbValue[self.__match_renamed_field("size")].address)
         start_address = size_field_address if self.prev_inuse else self.address
 
         next = self.next_chunk()
@@ -462,10 +464,12 @@ class Chunk:
         if next is None:
             end_address = size_field_address + self.real_size
         else:
-            next_size_field_address = next._gdbValue[self.__match_renamed_field("size")].address
+            next_size_field_address = int(
+                next._gdbValue[self.__match_renamed_field("size")].address
+            )
             end_address = next_size_field_address if next.prev_inuse else next.address
 
-        return start_address <= addr < end_address  # type: ignore[operator]
+        return start_address <= addr < end_address
 
 
 class Heap:
@@ -1110,7 +1114,7 @@ class GlibcMemoryAllocator(pwndbg.aglib.heap.heap.MemoryAllocator, Generic[TheTy
     @pwndbg.lib.cache.cache_until("objfile")
     def malloc_alignment(self) -> int:
         """Corresponds to MALLOC_ALIGNMENT in glibc malloc.c"""
-        if pwndbg.aglib.arch.current == "i386" and pwndbg.glibc.get_version() >= (2, 26):
+        if pwndbg.aglib.arch.name == "i386" and pwndbg.glibc.get_version() >= (2, 26):
             # i386 will override it to 16 when GLIBC version >= 2.26
             # See https://elixir.bootlin.com/glibc/glibc-2.26/source/sysdeps/i386/malloc-alignment.h#L22
             return 16
@@ -1148,11 +1152,10 @@ class GlibcMemoryAllocator(pwndbg.aglib.heap.heap.MemoryAllocator, Generic[TheTy
     @pwndbg.lib.cache.cache_until("objfile", "thread")
     def multithreaded(self) -> bool:
         """Is malloc operating within a multithreaded environment."""
-        si = pwndbg.dbg.selected_inferior()
-        addr = si.symbol_address_from_name("__libc_multiple_threads")
+        addr = pwndbg.aglib.symbol.lookup_symbol_addr("__libc_multiple_threads")
         if addr:
             return pwndbg.aglib.memory.s32(addr) > 0
-        return len(si.threads()) > 1
+        return len(pwndbg.dbg.selected_inferior().threads()) > 1
 
     def _request2size(self, req: int) -> int:
         """Corresponds to request2size in glibc malloc.c"""
@@ -1530,17 +1533,26 @@ class GlibcMemoryAllocator(pwndbg.aglib.heap.heap.MemoryAllocator, Generic[TheTy
         """
         return (
             pwndbg.aglib.typeinfo.load("struct malloc_chunk") is not None
-            and pwndbg.dbg.selected_inferior().symbol_address_from_name("global_max_fast")
+            and pwndbg.aglib.symbol.lookup_symbol_addr("global_max_fast", prefer_static=True)
             is not None
         )
 
 
 class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Value]):
-    can_be_resolved = GlibcMemoryAllocator.libc_has_debug_syms
+    def can_be_resolved(self) -> bool:
+        if not self.libc_has_debug_syms():
+            return False
+        # Check if thread_arena is needed and available, but if the binary is not multithreaded, then we don't care
+        # Note: it's possible that we unstripped the libc but still don't have libthread_db.so
+        return (
+            not self.multithreaded
+            or pwndbg.aglib.symbol.lookup_symbol_addr("thread_arena", prefer_static=True)
+            is not None
+        )
 
     @property
     def main_arena(self) -> Arena | None:
-        self._main_arena_addr = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        self._main_arena_addr = pwndbg.aglib.symbol.lookup_symbol_addr(
             "main_arena", prefer_static=True
         )
         if self._main_arena_addr is not None:
@@ -1554,14 +1566,14 @@ class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Val
     @property
     def thread_arena(self) -> Arena | None:
         if self.multithreaded:
-            thread_arena_addr = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+            thread_arena_addr = pwndbg.aglib.symbol.lookup_symbol_addr(
                 "thread_arena", prefer_static=True
             )
             if thread_arena_addr:
-                thread_arena_value = pwndbg.aglib.memory.pvoid(thread_arena_addr)
+                thread_arena_value = pwndbg.aglib.memory.read_pointer_width(thread_arena_addr)
                 # thread_arena might be NULL if the thread doesn't allocate arena yet
                 if thread_arena_value:
-                    return Arena(pwndbg.aglib.memory.pvoid(thread_arena_addr))
+                    return Arena(pwndbg.aglib.memory.read_pointer_width(thread_arena_addr))
             return None
         else:
             return self.main_arena
@@ -1573,10 +1585,8 @@ class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Val
         """
         if self.has_tcache():
             if self.multithreaded:
-                tcache_addr = pwndbg.aglib.memory.pvoid(
-                    pwndbg.dbg.selected_inferior().symbol_address_from_name(
-                        "tcache", prefer_static=True
-                    )
+                tcache_addr = pwndbg.aglib.memory.read_pointer_width(
+                    pwndbg.aglib.symbol.lookup_symbol_addr("tcache", prefer_static=True)
                 )
                 if tcache_addr == 0:
                     # This thread doesn't have a tcache yet
@@ -1606,9 +1616,7 @@ class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Val
 
     @property
     def mp(self) -> pwndbg.dbg_mod.Value | None:
-        self._mp_addr = pwndbg.dbg.selected_inferior().symbol_address_from_name(
-            "mp_", prefer_static=True
-        )
+        self._mp_addr = pwndbg.aglib.symbol.lookup_symbol_addr("mp_", prefer_static=True)
         if self._mp_addr is not None and self.malloc_par is not None:
             self._mp = pwndbg.aglib.memory.get_typed_pointer_value(self.malloc_par, self._mp_addr)
 
@@ -1616,7 +1624,7 @@ class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Val
 
     @property
     def global_max_fast(self) -> int | None:
-        self._global_max_fast_addr = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        self._global_max_fast_addr = pwndbg.aglib.symbol.lookup_symbol_addr(
             "global_max_fast", prefer_static=True
         )
         if self._global_max_fast_addr is not None:
@@ -1695,10 +1703,9 @@ class DebugSymsHeap(GlibcMemoryAllocator[pwndbg.dbg_mod.Type, pwndbg.dbg_mod.Val
         return sbrk_region
 
     def is_initialized(self) -> bool:
-        si = pwndbg.dbg.selected_inferior()
-        addr = si.symbol_address_from_name("__libc_malloc_initialized")
+        addr = pwndbg.aglib.symbol.lookup_symbol_addr("__libc_malloc_initialized")
         if addr is None:
-            addr = si.symbol_address_from_name("__malloc_initialized")
+            addr = pwndbg.aglib.symbol.lookup_symbol_addr("__malloc_initialized")
         assert addr is not None, "Could not find __libc_malloc_initialized or __malloc_initialized"
         return pwndbg.aglib.memory.s32(addr) > 0
 
@@ -1738,7 +1745,7 @@ class HeuristicHeap(
     @property
     def main_arena(self) -> Arena | None:
         main_arena_via_config = int(str(pwndbg.config.main_arena), 0)
-        main_arena_via_symbol = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        main_arena_via_symbol = pwndbg.aglib.symbol.lookup_symbol_addr(
             "main_arena", prefer_static=True
         )
         if main_arena_via_config or main_arena_via_symbol:
@@ -1918,7 +1925,7 @@ class HeuristicHeap(
                 and offset % pwndbg.aglib.arch.ptrsize == 0
                 and pwndbg.aglib.memory.is_readable_address(offset + tls_address)
             ):
-                guess = pwndbg.aglib.memory.pvoid(offset + tls_address)
+                guess = pwndbg.aglib.memory.read_pointer_width(offset + tls_address)
                 if validator(guess):
                     return guess, offset + tls_address
         return None
@@ -1940,7 +1947,7 @@ class HeuristicHeap(
             for addr in search_range:
                 if pwndbg.aglib.memory.is_readable_address(addr):
                     reading = True
-                    guess = pwndbg.aglib.memory.pvoid(addr)
+                    guess = pwndbg.aglib.memory.read_pointer_width(addr)
                     if validator(guess):
                         return guess, addr
                 elif reading:
@@ -1950,11 +1957,11 @@ class HeuristicHeap(
 
     @property
     def thread_arena(self) -> Arena | None:
-        thread_arena_via_symbol = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        thread_arena_via_symbol = pwndbg.aglib.symbol.lookup_symbol_addr(
             "thread_arena", prefer_static=True
         )
         if thread_arena_via_symbol:
-            thread_arena_value = pwndbg.aglib.memory.pvoid(thread_arena_via_symbol)
+            thread_arena_value = pwndbg.aglib.memory.read_pointer_width(thread_arena_via_symbol)
             return Arena(thread_arena_value) if thread_arena_value else None
         thread_arena_via_config = int(str(pwndbg.config.thread_arena), 0)
         if thread_arena_via_config:
@@ -2020,14 +2027,16 @@ class HeuristicHeap(
             return None
         tps = self.tcache_perthread_struct
         thread_cache_via_config = int(str(pwndbg.config.tcache), 0)
-        thread_cache_via_symbol = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        thread_cache_via_symbol = pwndbg.aglib.symbol.lookup_symbol_addr(
             "tcache", prefer_static=True
         )
         if thread_cache_via_config:
             self._thread_cache = tps(thread_cache_via_config)
             return self._thread_cache
         elif thread_cache_via_symbol:
-            thread_cache_struct_addr = pwndbg.aglib.memory.pvoid(thread_cache_via_symbol)
+            thread_cache_struct_addr = pwndbg.aglib.memory.read_pointer_width(
+                thread_cache_via_symbol
+            )
             if thread_cache_struct_addr:
                 self._thread_cache = tps(int(thread_cache_struct_addr))
                 return self._thread_cache
@@ -2095,9 +2104,7 @@ class HeuristicHeap(
     @property
     def mp(self) -> "pwndbg.aglib.heap.structs.CStruct2GDB":
         mp_via_config = int(str(pwndbg.config.mp), 0)
-        mp_via_symbol = pwndbg.dbg.selected_inferior().symbol_address_from_name(
-            "mp_", prefer_static=True
-        )
+        mp_via_symbol = pwndbg.aglib.symbol.lookup_symbol_addr("mp_", prefer_static=True)
         if mp_via_config or mp_via_symbol:
             self._mp_addr = mp_via_symbol
 
@@ -2126,7 +2133,7 @@ class HeuristicHeap(
     @property
     def global_max_fast(self) -> int:
         global_max_fast_via_config = int(str(pwndbg.config.global_max_fast), 0)
-        global_max_fast_via_symbol = pwndbg.dbg.selected_inferior().symbol_address_from_name(
+        global_max_fast_via_symbol = pwndbg.aglib.symbol.lookup_symbol_addr(
             "global_max_fast", prefer_static=True
         )
 

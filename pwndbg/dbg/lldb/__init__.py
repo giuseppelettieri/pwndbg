@@ -4,13 +4,17 @@ import bisect
 import collections
 import os
 import random
+import re
+import shlex
 import sys
+from contextlib import contextmanager
 from typing import Any
 from typing import Awaitable
 from typing import Callable
 from typing import Coroutine
 from typing import Dict
 from typing import Generator
+from typing import Iterator
 from typing import List
 from typing import Literal
 from typing import Sequence
@@ -21,9 +25,12 @@ import lldb
 from typing_extensions import override
 
 import pwndbg
+import pwndbg.color.message as M
 import pwndbg.lib.memory
 from pwndbg.aglib import load_aglib
 from pwndbg.dbg import selection
+from pwndbg.lib.arch import ArchDefinition
+from pwndbg.lib.arch import Platform
 from pwndbg.lib.regs import reg_sets
 
 T = TypeVar("T")
@@ -46,28 +53,6 @@ def rename_register(name: str, proc: LLDBProcess) -> str:
 
     # Nothing to change.
     return name
-
-
-class LLDBArch(pwndbg.dbg_mod.Arch):
-    def __init__(self, name: str, ptrsize: int, endian: Literal["little", "big"]):
-        self._endian = endian
-        self._name = name
-        self._ptrsize = ptrsize
-
-    @override
-    @property
-    def endian(self) -> Literal["little", "big"]:
-        return self._endian
-
-    @override
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @override
-    @property
-    def ptrsize(self) -> int:
-        return self._ptrsize
 
 
 class LLDBRegisters(pwndbg.dbg_mod.Registers):
@@ -101,6 +86,30 @@ class LLDBFrame(pwndbg.dbg_mod.Frame):
         self.proc = proc
 
     @override
+    def lookup_symbol(
+        self,
+        name: str,
+        *,
+        type: pwndbg.dbg_mod.SymbolLookupType = pwndbg.dbg_mod.SymbolLookupType.ANY,
+    ) -> pwndbg.dbg_mod.Value | None:
+        # FIXME: how to sanitize symbol name better?
+        if not re.match(r"^[a-zA-Z0-9_.:@*/$]+$", name):
+            raise pwndbg.dbg_mod.Error(f"Symbol {name!r} contains invalid characters")
+
+        value = None
+        try:
+            value = self.evaluate_expression(f"&{name}")
+        except pwndbg.dbg_mod.Error:
+            pass
+
+        if value is None:
+            # Fallback because `evaluate_expression` may fail to resolve symbols for TLS variables.
+            # This issue occurs on certain architectures (e.g., it works fine on x86_64 but fails on aarch64).
+            value = self.proc.lookup_symbol(name, type=type)
+
+        return value
+
+    @override
     def evaluate_expression(
         self, expression: str, lock_scheduler: bool = False
     ) -> pwndbg.dbg_mod.Value:
@@ -121,11 +130,16 @@ class LLDBFrame(pwndbg.dbg_mod.Frame):
         if val < 0:
             raise RuntimeError("Tried to write a register with a negative value")
 
+        if name not in pwndbg.aglib.regs:
+            return False
+
         # Writing to the PC using the normal register write flow causes the
         # inner object to be automatically invalidated by LLDB, so we have to
         # handle jumps manually using SBFrame::SetPC.
-        if name.lower() == reg_sets[pwndbg.aglib.arch.name].pc:
-            return self.inner.SetPC(val)
+        if name in (reg_sets[pwndbg.aglib.arch.name].pc, "pc"):
+            ret = self.inner.SetPC(val)
+            self.proc.dbg._trigger_event(pwndbg.dbg_mod.EventType.REGISTER_CHANGED)
+            return ret
 
         name = rename_register(name, self.proc)
 
@@ -162,16 +176,10 @@ class LLDBFrame(pwndbg.dbg_mod.Frame):
                     lambda f: thread.SetSelectedFrame(f.idx),
                 ):
                     # Run the command that sets the value of the register.
-                    result = lldb.SBCommandReturnObject()
-                    debugger.GetCommandInterpreter().HandleCommand(
-                        f"register write {name} {val}",
-                        result,
-                        False,
-                    )
-
-                    if result.GetErrorSize() > 0:
-                        error = result.GetError()
-                        print(error)
+                    try:
+                        self.proc.dbg._execute_lldb_command(f"register write {name} {val}")
+                    except pwndbg.dbg_mod.Error as e:
+                        error = str(e)
                         if f"'{name}'" in error and "not found" in error:
                             # Likely "error: Register not found for '{name}'"
                             return False
@@ -247,11 +255,12 @@ class LLDBThread(pwndbg.dbg_mod.Thread):
         self.proc = proc
 
     @override
-    def bottom_frame(self) -> pwndbg.dbg_mod.Frame:
+    @contextmanager
+    def bottom_frame(self) -> Iterator[pwndbg.dbg_mod.Frame]:
         if self.inner.GetNumFrames() <= 0:
-            return None
+            raise pwndbg.dbg_mod.Error("no frames")
 
-        return LLDBFrame(self.inner.GetFrameAtIndex(0), self.proc)
+        yield LLDBFrame(self.inner.GetFrameAtIndex(0), self.proc)
 
     @override
     def ptid(self) -> int | None:
@@ -280,9 +289,16 @@ def map_type_code(type: lldb.SBType) -> pwndbg.dbg_mod.TypeCode:
         return pwndbg.dbg_mod.TypeCode.POINTER
     if c == lldb.eTypeClassArray:
         return pwndbg.dbg_mod.TypeCode.ARRAY
+    if c == lldb.eTypeClassEnumeration:
+        return pwndbg.dbg_mod.TypeCode.ENUM
+    if c == lldb.eTypeClassFunction:
+        return pwndbg.dbg_mod.TypeCode.FUNC
+
+    basic_type = type.GetCanonicalType().GetBasicType()
+    if basic_type == lldb.eBasicTypeBool:
+        return pwndbg.dbg_mod.TypeCode.BOOL
 
     f = type.GetTypeFlags()
-
     if f & lldb.eTypeIsInteger != 0:
         return pwndbg.dbg_mod.TypeCode.INT
 
@@ -319,6 +335,25 @@ class LLDBType(pwndbg.dbg_mod.Type):
     def __init__(self, inner: lldb.SBType):
         self.inner = inner
 
+    @override
+    def __eq__(self, rhs: object) -> bool:
+        assert isinstance(rhs, LLDBType), "tried to compare LLDBType to other type"
+        other: LLDBType = rhs
+
+        return self.inner == other.inner
+
+    @property
+    @override
+    def name_identifier(self) -> str | None:
+        if self.inner.IsAnonymousType():
+            return None
+        return self.inner.name
+
+    @property
+    @override
+    def name_to_human_readable(self) -> str:
+        return self.inner.name
+
     @property
     @override
     def sizeof(self) -> int:
@@ -337,28 +372,58 @@ class LLDBType(pwndbg.dbg_mod.Type):
     @property
     @override
     def code(self) -> pwndbg.dbg_mod.TypeCode:
-        return map_type_code(self.inner)
+        try:
+            return map_type_code(self.inner)
+        except Exception:
+            # TODO: log invalid types
+            return pwndbg.dbg_mod.TypeCode.INVALID
 
     @override
-    def fields(self) -> List[pwndbg.dbg_mod.TypeField] | None:
-        fields = self.inner.get_fields_array()
-        return (
-            [
+    def func_arguments(self) -> List[pwndbg.dbg_mod.Type] | None:
+        if self.code != pwndbg.dbg_mod.TypeCode.FUNC:
+            raise TypeError("only available for function type")
+
+        args: List[lldb.SBType] = self.inner.GetFunctionArgumentTypes()
+        if not args:
+            return []
+        return [LLDBType(arg) for arg in args]
+
+    @override
+    def fields(self) -> List[pwndbg.dbg_mod.TypeField]:
+        if self.code == pwndbg.dbg_mod.TypeCode.ENUM:
+            fields_enum: List[lldb.SBTypeEnumMember] = self.inner.get_enum_members_array()
+            if not fields_enum:
+                return []
+            return [
                 pwndbg.dbg_mod.TypeField(
-                    field.bit_offset,
+                    0,
                     field.name,
                     LLDBType(field.type),
                     self,
-                    0,  # TODO: Handle fields for enum types differently.
+                    field.signed,
                     False,
-                    False,  # TODO: Handle base class members differently.
-                    field.bitfield_bit_size if field.is_bitfield else field.type.GetByteSize(),
+                    False,
+                    0,
                 )
-                for field in fields
+                for field in fields_enum
             ]
-            if len(fields) > 0
-            else None
-        )
+
+        fields: List[lldb.SBTypeMember] = self.inner.get_fields_array()
+        if not fields:
+            return []
+        return [
+            pwndbg.dbg_mod.TypeField(
+                field.bit_offset,
+                field.name,
+                LLDBType(field.type),
+                self,
+                0,
+                False,
+                False,  # TODO: Handle base class members differently.
+                field.bitfield_bit_size if field.is_bitfield else field.type.GetByteSize(),
+            )
+            for field in fields
+        ]
 
     @override
     def array(self, count: int) -> pwndbg.dbg_mod.Type:
@@ -372,7 +437,7 @@ class LLDBType(pwndbg.dbg_mod.Type):
     def strip_typedefs(self) -> pwndbg.dbg_mod.Type:
         t = self.inner
         while t.IsTypedefType():
-            t = t.GetTypedefedType
+            t = t.GetTypedefedType()
 
         return LLDBType(t)
 
@@ -462,7 +527,12 @@ class LLDBValue(pwndbg.dbg_mod.Value):
 
     @override
     def string(self) -> str:
-        addr = self.inner.unsigned
+        if self.inner.type.IsArrayType():
+            # Array types need to have their address taken in LLDB.
+            addr = self.inner.AddressOf().unsigned
+        else:
+            addr = self.inner.unsigned
+
         error = lldb.SBError()
 
         # Read strings up to 4GB.
@@ -481,20 +551,37 @@ class LLDBValue(pwndbg.dbg_mod.Value):
         return last_str
 
     @override
+    def value_to_human_readable(self) -> str:
+        return str(self.inner)
+
+    @override
     def fetch_lazy(self) -> None:
         # Not needed under LLDB.
         pass
 
     @override
     def __int__(self) -> int:
-        return self.inner.signed
+        # use unsigned in every pointer type
+        if self.type.code == pwndbg.dbg_mod.TypeCode.POINTER:
+            return self.inner.GetValueAsUnsigned()
+
+        # Logic is copied from lldb.value(self.inner).__int__()
+        is_num, is_sign = lldb.is_numeric_type(
+            self.inner.GetType().GetCanonicalType().GetBasicType()
+        )
+        if is_num and not is_sign:
+            return self.inner.GetValueAsUnsigned()
+        return self.inner.GetValueAsSigned()
 
     @override
     def cast(self, type: pwndbg.dbg_mod.Type | Any) -> pwndbg.dbg_mod.Value:
         assert isinstance(type, LLDBType)
-        t: LLDBType = type
+        type: LLDBType = type
 
-        return LLDBValue(self.inner.Cast(t.inner), self.proc)
+        if type.code == pwndbg.dbg_mod.TypeCode.FUNC:
+            raise pwndbg.dbg_mod.Error("Cast to function type is not allowed, use pointer")
+
+        return LLDBValue(self.inner.Cast(type.inner), self.proc)
 
     def _self_add_sub_int(self, val: int) -> pwndbg.dbg_mod.Value:
         """
@@ -552,20 +639,12 @@ class LLDBValue(pwndbg.dbg_mod.Value):
 
 class LLDBMemoryMap(pwndbg.dbg_mod.MemoryMap):
     def __init__(self, pages: List[pwndbg.lib.memory.Page]):
-        self.pages = pages
+        super().__init__(pages)
 
     @override
     def is_qemu(self) -> bool:
         # TODO/FIXME: Figure a way to detect QEMU later.
         return False
-
-    @override
-    def has_reliable_perms(self) -> bool:
-        return True
-
-    @override
-    def ranges(self) -> List[pwndbg.lib.memory.Page]:
-        return self.pages
 
 
 class LLDBStopPoint(pwndbg.dbg_mod.StopPoint):
@@ -609,8 +688,8 @@ class OneShotAwaitable:
     def __init__(self, value: Any):
         self.value = value
 
-    def __await__(self) -> Generator[Any, Any, None]:
-        yield self.value
+    def __await__(self) -> Generator[Any, Any, Any]:
+        return (yield self.value)
 
 
 class YieldContinue:
@@ -624,9 +703,11 @@ class YieldContinue:
     """
 
     target: LLDBStopPoint
+    selected_thread: bool
 
-    def __init__(self, target: LLDBStopPoint):
+    def __init__(self, target: LLDBStopPoint, selected_thread: bool = False):
         self.target = target
+        self.selected_thread = selected_thread
 
 
 class YieldSingleStep:
@@ -650,6 +731,11 @@ class LLDBExecutionController(pwndbg.dbg_mod.ExecutionController):
     def cont(self, target: pwndbg.dbg_mod.StopPoint) -> Awaitable[None]:
         assert isinstance(target, LLDBStopPoint)
         return OneShotAwaitable(YieldContinue(target))
+
+    @override
+    def cont_selected_thread(self, target: pwndbg.dbg_mod.StopPoint) -> Awaitable[None]:
+        assert isinstance(target, LLDBStopPoint)
+        return OneShotAwaitable(YieldContinue(target, selected_thread=True))
 
 
 # Our execution controller doesn't need to change between uses, as all the state
@@ -695,6 +781,12 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         )
 
     @override
+    def stopped_with_signal(self) -> bool:
+        return self.process.GetState() == lldb.eStateStopped and any(
+            (thread.GetStopReason() == lldb.eStopReasonSignal for thread in self.process.threads)
+        )
+
+    @override
     def evaluate_expression(self, expression: str) -> pwndbg.dbg_mod.Value:
         value = self.target.EvaluateExpression(expression)
         opt_out = _is_optimized_out(value)
@@ -704,8 +796,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
 
         return LLDBValue(value, self)
 
-    @override
-    def vmmap(self) -> pwndbg.dbg_mod.MemoryMap:
+    def get_known_pages(self) -> List[pwndbg.lib.memory.Page]:
         regions = self.process.GetMemoryRegions()
 
         pages = []
@@ -736,7 +827,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
 
                 # Try to resolve the name anyway by using SBAddress.
                 file = lldb.SBAddress(region.GetRegionBase(), self.target).GetModule().GetFileSpec()
-                objfile = file.fullpath if file.IsValid() else "<unknown>"
+                objfile = file.fullpath if file.IsValid() else f"[anon_{start >> 12:05x}]"
 
             perms = 0
             if region.IsReadable():
@@ -772,6 +863,21 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
                 )
             )
 
+        return pages
+
+    @override
+    def vmmap(self) -> pwndbg.dbg_mod.MemoryMap:
+        pages = self.get_known_pages()
+        if pages:
+            return LLDBMemoryMap(pages)
+
+        from pwndbg.aglib.kernel.vmmap import kernel_vmmap
+        from pwndbg.aglib.vmmap_custom import get_custom_pages
+
+        pages: List[pwndbg.lib.memory.Page] = []
+        pages.extend(kernel_vmmap())
+        pages.extend(get_custom_pages())
+        pages.sort()
         return LLDBMemoryMap(pages)
 
     def find_largest_range_len(
@@ -815,7 +921,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         e = lldb.SBError()
         buffer = self.process.ReadMemory(address, size, e)
         if buffer:
-            return buffer
+            return bytearray(buffer)
         elif not partial:
             raise pwndbg.dbg_mod.Error(f"could not read {size:#x} bytes: {e}")
 
@@ -858,7 +964,11 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
                 pass
 
         # Second, try to do a binary search for the limit of the range.
-        def test(s):
+        def test(s: int):
+            # ReadMemory fail when passing size <= 0
+            if s <= 0:
+                return False
+
             b = self.process.ReadMemory(address, s, e)
             return b is not None
 
@@ -973,7 +1083,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         return self._is_gdb_remote
 
     @override
-    def send_remote(self, packet: str) -> str:
+    def send_remote(self, packet: str) -> bytes:
         if len(packet) == 0:
             raise pwndbg.dbg_mod.Error("Empty packets are not allowed")
         if not self._is_gdb_remote:
@@ -982,17 +1092,26 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         # As of LLDB 18, there isn't a way for us to do this directly, so we
         # have to use the command. The implementation of the command calls into
         # private APIs.
-        result = lldb.SBCommandReturnObject()
-        self.dbg.debugger.GetCommandInterpreter().HandleCommand(
-            f"process plugin packet send {packet}",
-            result,
-            False,
-        )
-        assert (
-            result.GetErrorSize() == 0
-        ), "Remote packet errors shouldn't be reported as LLDB command errors. We probably got something wrong"
 
-        return result.GetOutput()
+        # FIXME: `plugin packet send` Don't handle well bytes or nullbytes, because they use `%s` in lldb[1]
+        # [1] https://github.com/llvm/llvm-project/blob/6c42d0d7df55f28084e41b482dd7c25d4e7bcd10/lldb/source/Plugins/Process/gdb-remote/ProcessGDBRemote.cpp#L5660
+        response = self.dbg._execute_lldb_command(f"process plugin packet send {packet}")
+
+        try:
+            idx = response.index("\nresponse: ")
+        except ValueError:
+            # Packets not implemented return empty
+            return b""
+
+        out = response[idx + 11 :]  # len("\nresponse: ") == 11
+        if out.startswith("\nerror: "):
+            # Packets not implemented return empty
+            return b""
+
+        if out[-1] == "\n":
+            out = out[:-1]
+
+        return out.encode()
 
     @override
     def send_monitor(self, cmd: str) -> str:
@@ -1001,18 +1120,14 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         if not self._is_gdb_remote:
             raise RuntimeError("Called send_monitor() on a local process")
 
-        # Same as `send_remote()`.
-        result = lldb.SBCommandReturnObject()
-        self.dbg.debugger.GetCommandInterpreter().HandleCommand(
-            f"process plugin packet monitor {cmd}",
-            result,
-            False,
-        )
-        assert (
-            result.GetErrorSize() == 0
-        ), "Remote monitor errors shouldn't be reported as LLDB command errors. We probably got something wrong"
+        # `process plugin packet monitor {cmd}` command is returned in an ugly way, eg:
+        # "Host virtual address for 0x1000 (virt.flash0) is 0xe2780fc01000\r\n  packet: qRcmd,6770613268766120307831303030\nresponse: OK\n"
+        # We need to cut the string, so it matches the same format we have in GDB.
 
-        return result.GetOutput()
+        res = self.dbg._execute_lldb_command(f"process plugin packet monitor {cmd}")
+        if (idx := res.rindex("  packet: ")) > -1:
+            return res[:idx]
+        return res
 
     @override
     def download_remote_file(self, remote_path: str, local_path: str) -> None:
@@ -1053,7 +1168,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
 
         if not remote.IsValid():
             raise pwndbg.dbg_mod.Error(f"LLDB considers the path '{remote_path}' invalid")
-        if local.IsValid():
+        if not local.IsValid():
             raise pwndbg.dbg_mod.Error(f"LLDB considers the path '{local_path} invalid'")
 
         error = platform.Get(remote, local)
@@ -1095,17 +1210,25 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
     @override
     def symbol_name_at_address(self, address: int) -> str | None:
         addr = lldb.SBAddress(address, self.target)
-        ctx = self.target.ResolveSymbolContextForAddress(addr, lldb.eSymbolContextSymbol)
+
+        # We are using `lldb.eSymbolContextEverything` because it can find symbols without debug info.
+        # Additional information:
+        # `eSymbolContextVariable` is potentially expensive to look up,
+        # so it is not included in `eSymbolContextEverything`.
+        ctx = self.target.ResolveSymbolContextForAddress(addr, lldb.eSymbolContextEverything)
 
         if not ctx.IsValid() or not ctx.symbol.IsValid():
             return None
 
+        # TODO: In GDB, we return something like `main+0x10`, but in LLDB, we do not.
         return ctx.symbol.name
 
     def _resolve_tls_symbol(self, sym: lldb.SBSymbol) -> int | None:
         """
         Attemps to resolve the address of a symbol stored in TLS.
         """
+        # Please read book: https://akkadia.org/drepper/tls.pdf
+        #
         # LLDB doesn't handle symbols marked with STT_TLS at all[1], which
         # means that not only will they not have a type, they will also
         # give completely wrong results for GetStartAddress(), meaning we
@@ -1117,8 +1240,7 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         # far from reliable, but it's the best we've got until LLDB gives us
         # a proper way to handle these symbols.
         #
-        # Additionally, this is a Linux+Glibc+x86_64-only workaround, for
-        # now. We might need to expand it to other systems as time goes on.
+        # Additionally, this is a Linux+Glibc-only workaround, for now.
         # We'll see. We should also consider parsing the symbols in the ELF
         # file associated with the module LLDB found the symbol in, to check
         # for whether this is a TLS symbol.
@@ -1130,12 +1252,6 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         # [1]: https://github.com/llvm/llvm-project/blob/86cf67ffc1ee62c65bef313bf58ae70f74afb7c1/lldb/source/Plugins/ObjectFile/ELF/ObjectFileELF.cpp#L2140
 
         if not self.is_linux():
-            print(
-                f"warning: symbol '{sym.GetName()}' might be a TLS symbol, but Pwndbg only knows how to resolve those in x86-64 GNU/Linux"
-            )
-            return None
-
-        if not self.arch().name == "x86-64":
             print(
                 f"warning: symbol '{sym.GetName()}' might be a TLS symbol, but Pwndbg only knows how to resolve those in x86-64 GNU/Linux"
             )
@@ -1163,16 +1279,13 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         # [1]: https://elixir.bootlin.com/glibc/glibc-2.40.9000/source/sysdeps/x86_64/nptl/tls.h#L70
         # [2]: https://elixir.bootlin.com/glibc/glibc-2.40.9000/source/sysdeps/generic/dl-dtv.h#L33
         offset = sym.GetValue()
+        import pwndbg.aglib.memory
 
-        for i in range(self.target.GetNumModules() + 1):
-            # This is the same as `tls_base->dtv[i].pointer.val + offset`.
-            candidate = (
-                pwndbg.aglib.memory.pvoid(pwndbg.aglib.memory.pvoid(tls_base + 8) + (16 * i))
-                + offset
-            )
+        tls_base_typed = pwndbg.aglib.memory.get_typed_pointer("typedef tcbhead_t", tls_base)
 
-            import pwndbg.aglib.memory
-
+        for module_id in range(self.target.GetNumModules() + 1):
+            # This is the same as `tls_base->dtv[module_id].pointer.val + offset`.
+            candidate = int(tls_base_typed["dtv"][module_id]["pointer"]["val"]) + offset
             if pwndbg.aglib.memory.peek(candidate):
                 # Take a guess that we hit the right TLS block and return what
                 # we got.
@@ -1184,34 +1297,165 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         return None
 
     @override
-    def symbol_address_from_name(self, name: str, prefer_static: bool = False) -> int | None:
-        # LLDB doesn't have the concept of a static block like GDB does, we just
-        # don't do anything to select for static variables if we're asked to do
-        # so.
-        symbols = self.target.FindSymbols(name)
+    def lookup_symbol(
+        self,
+        name: str,
+        *,
+        prefer_static: bool = False,
+        type: pwndbg.dbg_mod.SymbolLookupType = pwndbg.dbg_mod.SymbolLookupType.ANY,
+        objfile_endswith: str | None = None,
+    ) -> pwndbg.dbg_mod.Value | None:
+        objfile: lldb.SBModule | None = None
+        if objfile_endswith is not None:
+            for m in self.target.module_iter():
+                if str(m.file.fullpath).endswith(objfile_endswith):
+                    objfile = m
+                    break
+            if objfile is None:
+                raise pwndbg.dbg_mod.Error(f"Objfile '{objfile_endswith}' not found")
 
-        if symbols.GetSize() == 0:
+        symbol_for_preference = None
+        for sym, cast_type, resolved_addr in self._iter_symbols(name, type, objfile):
+            is_static = not sym.IsExternal()
+            if prefer_static == is_static:
+                symbol_for_preference = sym, cast_type, resolved_addr
+                break
+
+            if symbol_for_preference is None:
+                symbol_for_preference = sym, cast_type, resolved_addr
+
+        if symbol_for_preference is None:
             return None
 
-        sym = symbols.GetContextAtIndex(0).symbol
-        if not sym.IsValid():
-            return None
+        sym, cast_type, resolved_addr = symbol_for_preference
+        return self.create_value(resolved_addr, cast_type)
 
-        if sym.GetType() == lldb.eSymbolTypeAny:
-            # Symbols with type eSymbolTypeAny may be TLS symbols, try to resolve
-            # this one and see if we can get a reasonable answer.
-            tls = self._resolve_tls_symbol(sym)
-            if tls:
-                return tls
+    def _iter_symbols(
+        self, name: str, type: pwndbg.dbg_mod.SymbolLookupType, objfile: lldb.SBModule | None = None
+    ) -> Iterator[Tuple[lldb.SBSymbol, pwndbg.dbg_mod.Type, int]]:
+        # Info from commit: https://github.com/llvm/llvm-project/commit/bcf2cfbdc5f7b8998d1a06e2e4b640dd42a5b10f
+        # eSymbolTypeFunction: eSymbolTypeCode with IsDebug() == true
+        #   eSymbolTypeGlobal: eSymbolTypeData with IsDebug() == true and IsExternal() == true
+        #   eSymbolTypeStatic: eSymbolTypeData with IsDebug() == true and IsExternal() == false
+        #
+        # Global Variables:
+        # Use t.FindSymbols('main_arena', lldb.eSymbolTypeData)
+        #
+        # Global Functions:
+        # Use t.FindSymbols('free', lldb.eSymbolTypeCode)
+        #
+        # Local Variables:
+        # Directly finding local variables is not possible using t.FindSymbols
+        #
+        # Local/Global Variables, Functions, or Any Symbol:
+        # Use pwndbg.dbg.selected_frame().evaluate_expression('&result_local')
+        # Note that this approach works for both local and global variables as well as functions.
+        #
+        # Note using `evaluate_expression` on TLS Variables:
+        # TLS variables may not work on some architectures. For example, this approach
+        # works fine on x86_64, but may fail on aarch64 or other architectures.
 
-        return sym.GetStartAddress().GetLoadAddress(self.target)
+        # We need to map variable types to symbols...
+        # This approach may not work correctly if there are multiple global variables with the same <name> and <address>.
+        # The same address may occur for TLS symbols, as they have a `0xffffffffffffffff` address.
+        # NOTE: `FindGlobalVariables` returns ONLY variables that have DEBUG INFO.
+        variables_types: Dict[Tuple[int, str], LLDBType] = {}
+
+        if type in (pwndbg.dbg_mod.SymbolLookupType.VARIABLE, pwndbg.dbg_mod.SymbolLookupType.ANY):
+            variables: lldb.SBValueList = (objfile or self.target).FindGlobalVariables(name, 0)
+            var: lldb.SBValue
+            for var in variables:
+                # LLDB[1] is attempting to resolve a TLS variable, but it fails with the following error:
+                # [1] https://github.com/llvm/llvm-project/blob/1dfa34c8e1f28963f059e05ce89ebf1f76ebbddc/lldb/source/Expression/DWARFExpression.cpp#L2198
+                #
+                # is_tls = var.error and var.error.description == 'no thread to evaluate TLS within'
+
+                # <address>, <variable_name>
+                key = (int(var.GetLoadAddress()), var.GetName())
+                variables_types[key] = LLDBType(var.GetType())
+
+        domains = {
+            pwndbg.dbg_mod.SymbolLookupType.ANY: (lldb.eSymbolTypeAny,),
+            # TLS variables are included under `eSymbolTypeAny`, so we need to check
+            pwndbg.dbg_mod.SymbolLookupType.VARIABLE: (lldb.eSymbolTypeData, lldb.eSymbolTypeAny),
+            pwndbg.dbg_mod.SymbolLookupType.FUNCTION: (lldb.eSymbolTypeCode,),
+        }[type]
+
+        symbols_iter: Iterator[lldb.SBSymbolContextList] = (
+            (objfile or self.target).FindSymbols(name, domain) for domain in domains
+        )
+        for symbols in symbols_iter:
+            size = symbols.GetSize()
+            if size == 0:
+                continue
+
+            for i in range(size):
+                sym: lldb.SBSymbol = symbols.GetContextAtIndex(i).symbol
+                if not sym:
+                    continue
+
+                if not sym.IsValid():
+                    continue
+
+                addr: lldb.SBAddress = sym.GetStartAddress()
+                if not addr.IsValid():
+                    continue
+
+                resolved_addr = addr.GetLoadAddress(self.target)
+                resolved_size = sym.GetSize()
+                sym_name = sym.GetName()
+
+                cast_type: pwndbg.dbg_mod.Type
+                if addr.function.IsValid():
+                    # is function
+                    cast_type = LLDBType(addr.function.type).pointer()
+                else:
+                    # is variable maybe or others types
+
+                    # LLDB lacks support for types in symbols
+                    # So we have manually find types
+                    cast_type = variables_types.get((resolved_addr, sym_name), None)
+                    if cast_type is not None:
+                        # Detect if we have proper symbol by size, we can't do better here
+                        if cast_type.sizeof != resolved_size:
+                            print(
+                                M.warn(
+                                    f"WARNING: Symbol {sym_name} has invalid size (has:{cast_type.sizeof:02x}, needed:{resolved_size:02x}), should not happen"
+                                )
+                            )
+
+                        # Cast to pointer, we are returning address at end ;)
+                        cast_type = cast_type.pointer()
+                    else:
+                        # Address without/unknown type, we cast to void pointer
+                        # This happens eg:
+                        # - when function don't have debug info
+                        # - variable has missing debug info
+                        # TODO: Should we create a 'pvoidfunc' type.
+                        #   This could be useful for identifying functions without debug info.
+                        cast_type = pwndbg.aglib.typeinfo.pvoid
+
+                sym_type = sym.GetType()
+                if addr.section.name in (".tbss", ".tdata") and sym_type == lldb.eSymbolTypeInvalid:
+                    # Additionally, we check only TLS sections (.tbss and .tdata).
+                    # Symbols with type eSymbolTypeInvalid might represent TLS symbols.
+                    # Attempt to resolve this symbol and verify if it provides a valid result.
+                    tls = self._resolve_tls_symbol(sym)
+                    if tls:
+                        yield sym, cast_type, tls
+                    continue
+
+                if resolved_addr == lldb.LLDB_INVALID_ADDRESS:
+                    continue
+
+                yield sym, cast_type, resolved_addr
 
     def types_with_name(self, name: str) -> Sequence[pwndbg.dbg_mod.Type]:
         types = self.target.FindTypes(name)
         return [LLDBType(types.GetTypeAtIndex(i)) for i in range(types.GetSize())]
 
     @override
-    def arch(self) -> pwndbg.dbg_mod.Arch:
+    def arch(self) -> ArchDefinition:
         endian0 = self.process.GetByteOrder()
         endian1 = self.target.GetByteOrder()
 
@@ -1262,10 +1506,11 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
             # of ARM. Pwndbg needs that distinction, so we attempt to detect
             # Cortex-M varieties by querying for the presence of the `xpsr`
             # register.
-            has_xpsr = [
-                thread.bottom_frame().regs().by_name("xpsr") is not None
-                for thread in self.threads()
-            ]
+            def _has_xpsr(thread) -> bool:
+                with thread.bottom_frame() as frame:
+                    return frame.regs().by_name("xpsr") is not None
+
+            has_xpsr = [_has_xpsr(thread) for thread in self.threads()]
             assert (
                 all(has_xpsr) or not any(has_xpsr)
             ), "Either all threads are Cortex-M or none are, Pwndbg doesn't know how to handle other cases"
@@ -1275,15 +1520,23 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         elif name == "arm64":
             # Apple uses a different name for AArch64 than we do.
             name = "aarch64"
+        elif name == "arm64e":
+            # Apple uses a different name for AArch64 than we do.
+            name = "aarch64"
+        elif name == "riscv32":
+            # Pwndbg use a different name for riscv32.
+            name = "rv32"
+        elif name == "riscv64":
+            # Pwndbg use a different name for riscv64.
+            name = "rv64"
 
-        return LLDBArch(name, ptrsize0, endian)
+        return ArchDefinition(name=name, ptrsize=ptrsize0, endian=endian, platform=Platform.LINUX)
 
     @override
     def break_at(
         self,
         location: pwndbg.dbg_mod.BreakpointLocation | pwndbg.dbg_mod.WatchpointLocation,
         stop_handler: Callable[[pwndbg.dbg_mod.StopPoint], bool] | None = None,
-        one_shot: bool = False,
         internal: bool = False,
     ) -> pwndbg.dbg_mod.StopPoint:
         if isinstance(location, pwndbg.dbg_mod.BreakpointLocation):
@@ -1347,9 +1600,28 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         return sp
 
     @override
+    def disasm(self, address: int) -> pwndbg.dbg_mod.DisassembledInstruction | None:
+        instructions = self.target.ReadInstructions(lldb.SBAddress(address, self.target), 1)
+        if not instructions.IsValid() or instructions.GetSize() == 0:
+            return None
+
+        instr: lldb.SBInstruction = instructions.GetInstructionAtIndex(0)
+        mnemonic = instr.GetMnemonic(self.target)
+        operands = instr.GetOperands(self.target)
+
+        return {
+            "addr": instr.GetAddress().GetLoadAddress(self.target),
+            "asm": f"{mnemonic} {operands}",
+            "length": instr.GetByteSize(),
+        }
+
+    @override
     def is_linux(self) -> bool:
         # LLDB will at most tell us if this is a SysV ABI process.
-        return self.target.GetABIName().startswith("sysv")
+        # Returns eg:
+        # - 'SysV-arm64'
+        # - 'ABIMacOSX_arm64'
+        return self.target.GetABIName().lower().startswith("sysv")
 
     def _resolve_fullpath(self, spec: lldb.SBFileSpec) -> str:
         """
@@ -1362,7 +1634,11 @@ class LLDBProcess(pwndbg.dbg_mod.Process):
         if len(link) == 0:
             return spec.fullpath
 
-        return os.path.normpath(f"{spec.dirname}/{link}")
+        # Get the absolute path if it is not already absolute.
+        if not os.path.isabs(link):
+            link = os.path.normpath(f"{spec.dirname}/{link}")
+
+        return link
 
     @override
     def module_section_locations(self) -> List[Tuple[int, int, str, str]]:
@@ -1443,6 +1719,9 @@ class LLDB(pwndbg.dbg_mod.Debugger):
     # them by means of the `_trigger_event()` method.
     event_handlers: Dict[pwndbg.dbg_mod.EventType, List[Callable[..., T]]]
 
+    # Event types may be suspended. We keep track of that here.
+    suspended_events: Dict[pwndbg.dbg_mod.EventType, bool]
+
     # The prompt hook fired right before the prompt is displayed.
     prompt_hook: Callable[[], None]
 
@@ -1457,12 +1736,20 @@ class LLDB(pwndbg.dbg_mod.Debugger):
 
     @override
     def setup(self, *args, **kwargs):
+        import pwnlib.update
+
+        pwnlib.update.disabled = True
+
         self.exec_states = []
         self.event_handlers = {}
         self.controllers = []
         self._current_process_is_gdb_remote = False
 
-        debugger = args[0]
+        import pwndbg
+
+        self.suspended_events = {a: False for a in pwndbg.dbg_mod.EventType}
+
+        debugger: lldb.SBDebugger = args[0]
         assert (
             debugger.__class__ is lldb.SBDebugger
         ), "lldbinit.py should call setup() with an lldb.SBDebugger object"
@@ -1485,7 +1772,19 @@ class LLDB(pwndbg.dbg_mod.Debugger):
         pwndbg.commands.comments.init()
 
         import pwndbg.dbg.lldb.hooks
-        import pwndbg.dbg.lldb.pset
+
+    def _execute_lldb_command(self, command: str) -> str:
+        result = lldb.SBCommandReturnObject()
+        self.debugger.GetCommandInterpreter().HandleCommand(
+            command,
+            result,
+            False,
+        )
+        if not result.Succeeded():
+            if result.GetErrorSize() > 0:
+                raise pwndbg.dbg_mod.Error(result.GetError())
+            raise pwndbg.dbg_mod.Error("lldb command failed without error")
+        return result.GetOutput()
 
     @override
     def add_command(
@@ -1540,7 +1839,7 @@ class LLDB(pwndbg.dbg_mod.Debugger):
 
     @override
     def lex_args(self, command_line: str) -> List[str]:
-        return command_line.split()
+        return shlex.split(command_line)
 
     def _any_inferior(self) -> LLDBProcess | None:
         """
@@ -1674,6 +1973,14 @@ class LLDB(pwndbg.dbg_mod.Debugger):
 
         return decorator
 
+    @override
+    def suspend_events(self, ty: pwndbg.dbg_mod.EventType) -> None:
+        self.suspended_events[ty] = True
+
+    @override
+    def resume_events(self, ty: pwndbg.dbg_mod.EventType) -> None:
+        self.suspended_events[ty] = False
+
     def _fire_prompt_hook(self) -> None:
         """
         The REPL calls this function in order to signal that the prompt hooks
@@ -1690,14 +1997,17 @@ class LLDB(pwndbg.dbg_mod.Debugger):
         if ty not in self.event_handlers:
             # No one cares about this event type.
             return
+        if self.suspended_events[ty] or self.suspended_events[pwndbg.dbg_mod.EventType.SUSPEND_ALL]:
+            # This event has been suspended.
+            return
 
         for handler in self.event_handlers[ty]:
             try:
                 handler()
             except Exception as e:
-                import pwndbg.exception
+                from pwndbg.exception import handle as pwndbg_exception
 
-                pwndbg.exception.handle()
+                pwndbg_exception()
                 raise e
 
     @override
@@ -1709,22 +2019,31 @@ class LLDB(pwndbg.dbg_mod.Debugger):
         return True
 
     @override
+    def breakpoint_locations(self) -> List[pwndbg.dbg_mod.BreakpointLocation]:
+        inferior: LLDBProcess = self.selected_inferior()
+        if inferior is None:
+            return []
+
+        bps: List[lldb.SBBreakpoint] = inferior.target.breakpoints
+        locations: List[pwndbg.dbg_mod.BreakpointLocation] = []
+        for bp in bps:
+            if bp.IsValid() and bp.IsEnabled():
+                for location in bp.locations:
+                    locations.append(location.GetAddress().GetLoadAddress(inferior.target))
+        return locations
+
+    @override
+    def name(self) -> pwndbg.dbg_mod.DebuggerType:
+        return pwndbg.dbg_mod.DebuggerType.LLDB
+
+    @override
     def x86_disassembly_flavor(self) -> Literal["att", "intel"]:
         # Example:
         # (lldb) settings show target.x86-disassembly-flavor
         # target.x86-disassembly-flavor (enum) = default
         #
-        result = lldb.SBCommandReturnObject()
-        self.debugger.GetCommandInterpreter().HandleCommand(
-            "settings show target.x86-disassembly-flavor",
-            result,
-            False,
-        )
-        assert (
-            result.GetErrorSize() == 0
-        ), "This should be okay. Is target.x86-disassembly-flavor not a setting in all versions of LLDB?"
-
-        flavor = result.GetOutput().split("=")[1].strip()
+        result = self._execute_lldb_command("settings show target.x86-disassembly-flavor")
+        flavor = result.split("=")[1].strip()
         if flavor == "default":
             flavor = "intel"
 
@@ -1742,6 +2061,13 @@ class LLDB(pwndbg.dbg_mod.Debugger):
     def get_cmd_window_size(self) -> Tuple[int, int]:
         return None, None
 
+    @override
+    @property
+    def pre_ctx_lines(self) -> int:
+        # We control the REPL, and we don't print any extra lines
+        return 0
+
+    @override
     def is_gdblib_available(self):
         return False
 

@@ -3,19 +3,18 @@ from __future__ import annotations
 import argparse
 from typing import Union
 
+import pwndbg.aglib.file
+import pwndbg.aglib.shellcode
 import pwndbg.chain
 import pwndbg.color.message as message
 import pwndbg.commands
 import pwndbg.enhance
-import pwndbg.gdblib.file
-import pwndbg.gdblib.shellcode
 import pwndbg.lib.memory
 import pwndbg.wrappers.checksec
 import pwndbg.wrappers.readelf
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
     description="""
 Calls the mmap syscall and prints its resulting address.
 
@@ -24,25 +23,13 @@ Note that the mmap syscall may fail for various reasons
 will not be a valid pointer.
 
 PROT values: NONE (0), READ (1), WRITE (2), EXEC (4)
+
 MAP values: SHARED (1), PRIVATE (2), SHARED_VALIDATE (3), FIXED (0x10),
             ANONYMOUS (0x20)
 
 Flags and protection values can be either a string containing the names of the
 flags or permissions or a single number corresponding to the bitwise OR of the
 protection and flag numbers.
-
-Examples:
-    mmap 0x0 4096 PROT_READ|PROT_WRITE|PROT_EXEC MAP_PRIVATE|MAP_ANONYMOUS -1 0
-     - Maps a new private+anonymous page with RWX permissions at a location
-       decided by the kernel.
-
-    mmap 0x0 4096 PROT_READ MAP_PRIVATE 10 0
-     - Maps 4096 bytes of the file pointed to by file descriptor number 10 with
-       read permission at a location decided by the kernel.
-
-    mmap 0xdeadbeef 0x1000
-     - Maps a new private+anonymous page with RWX permissions at a page boundary
-       near 0xdeadbeef.
 """,
 )
 parser.add_argument(
@@ -140,7 +127,23 @@ def parse_str_or_int(val: Union[str, int], parser):
         raise TypeError(f"invalid type for value: {type(val)}")
 
 
-@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.MEMORY)
+@pwndbg.commands.Command(
+    parser,
+    category=CommandCategory.MEMORY,
+    examples="""
+mmap 0x0 4096 PROT_READ|PROT_WRITE|PROT_EXEC MAP_PRIVATE|MAP_ANONYMOUS -1 0
+ - Maps a new private+anonymous page with RWX permissions at a location
+   decided by the kernel.
+
+mmap 0x0 4096 PROT_READ MAP_PRIVATE 10 0
+ - Maps 4096 bytes of the file pointed to by file descriptor number 10 with
+   read permission at a location decided by the kernel.
+
+mmap 0xdeadbeef 0x1000
+ - Maps a new private+anonymous page with RWX permissions at a page boundary
+   near 0xdeadbeef.
+""",
+)
 @pwndbg.commands.OnlyWhenRunning
 def mmap(addr, length, prot=7, flags=0x22, fd=-1, offset=0, quiet=False, force=False) -> None:
     try:
@@ -183,7 +186,7 @@ instead.\
         if not force:
             page = pwndbg.lib.memory.Page(addr, int(length), 0, 0)
             collisions = []
-            vm = pwndbg.gdblib.vmmap.get()
+            vm = pwndbg.aglib.vmmap.get()
 
             # FIXME: The ends of the maps are sorted. We could bisect the array
             # in order to quickly reject all of the items we could never hit
@@ -241,14 +244,18 @@ using the address {aligned_addr:#x} instead.\
             )
         )
 
-    pointer = pwndbg.gdblib.shellcode.exec_syscall(
-        "SYS_mmap",
-        int(pwndbg.lib.memory.page_align(addr)),
-        int(length),
-        prot_int,
-        flag_int,
-        int(fd),
-        int(offset),
-    )
+    async def ctrl(ec: pwndbg.dbg_mod.ExecutionController):
+        pointer = await pwndbg.aglib.shellcode.exec_syscall(
+            ec,
+            "SYS_mmap",
+            int(pwndbg.lib.memory.page_align(addr)),
+            int(length),
+            prot_int,
+            flag_int,
+            int(fd),
+            int(offset),
+        )
 
-    print(f"mmap syscall returned {pointer:#x}")
+        print(f"mmap syscall returned {pointer:#x}")
+
+    pwndbg.dbg.selected_inferior().dispatch_execution_controller(ctrl)

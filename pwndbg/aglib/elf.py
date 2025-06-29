@@ -30,15 +30,14 @@ import pwndbg.aglib.file
 import pwndbg.aglib.memory
 import pwndbg.aglib.proc
 import pwndbg.aglib.qemu
+import pwndbg.aglib.symbol
 import pwndbg.aglib.vmmap
+import pwndbg.auxv
 import pwndbg.lib.cache
 import pwndbg.lib.elftypes
 import pwndbg.lib.memory
 from pwndbg.color import message
 from pwndbg.dbg import EventType
-
-if pwndbg.dbg.is_gdblib_available():
-    import pwndbg.auxv
 
 # ELF constants
 PF_X, PF_W, PF_R = 1, 2, 4
@@ -209,7 +208,7 @@ def dump_section_by_name(
     """
     Dump the content of a section from an ELF file, return the start address, size and content.
     """
-    # TODO: We should have some cache mechanism or something at `pndbg.gdblib.file.get_file()` in the future to avoid downloading the same file multiple times when we are debugging a remote process
+    # TODO: We should have some cache mechanism or something at `pndbg.aglib.file.get_file()` in the future to avoid downloading the same file multiple times when we are debugging a remote process
     local_path = pwndbg.aglib.file.get_file(filepath, try_local_path=try_local_path)
 
     with open(local_path, "rb") as f:
@@ -224,7 +223,7 @@ def dump_relocations_by_section_name(
     """
     Dump the relocation entries of a section from an ELF file, return a generator of Relocation objects.
     """
-    # TODO: We should have some cache mechanism or something at `pndbg.gdblib.file.get_file()` in the future to avoid downloading the same file multiple times when we are debugging a remote process
+    # TODO: We should have some cache mechanism or something at `pndbg.aglib.file.get_file()` in the future to avoid downloading the same file multiple times when we are debugging a remote process
     local_path = pwndbg.aglib.file.get_file(filepath, try_local_path=try_local_path)
 
     with open(local_path, "rb") as f:
@@ -254,10 +253,9 @@ def entry() -> int:
     """
     Return the address of the entry point for the main executable.
     """
-    if pwndbg.dbg.is_gdblib_available():
-        entry = pwndbg.auxv.get().AT_ENTRY
-        if entry:
-            return entry
+    entry = pwndbg.auxv.get().AT_ENTRY
+    if entry:
+        return entry
 
     inf = pwndbg.dbg.selected_inferior()
     entry = inf.main_module_entry()
@@ -267,7 +265,7 @@ def entry() -> int:
     # Try common names
     for name in ["_start", "start", "__start", "main"]:
         try:
-            return inf.symbol_address_from_name(name) or 0
+            return pwndbg.aglib.symbol.lookup_symbol_addr(name) or 0
         except pwndbg.dbg_mod.Error:
             pass
 
@@ -389,11 +387,11 @@ def map(pointer: int, objfile: str = "") -> Tuple[pwndbg.lib.memory.Page, ...]:
 
     Example:
 
-        >>> pwndbg.gdblib.elf.load(pwndbg.gdblib.regs.pc)
+        >>> pwndbg.aglib.elf.load(pwndbg.aglib.regs.pc)
         [Page('400000-4ef000 r-xp 0'),
          Page('6ef000-6f0000 r--p ef000'),
          Page('6f0000-6ff000 rw-p f0000')]
-        >>> pwndbg.gdblib.elf.load(0x7ffff77a2000)
+        >>> pwndbg.aglib.elf.load(0x7ffff77a2000)
         [Page('7ffff75e7000-7ffff77a2000 r-xp 0x1bb000 0'),
          Page('7ffff77a2000-7ffff79a2000 ---p 0x200000 1bb000'),
          Page('7ffff79a2000-7ffff79a6000 r--p 0x4000 1bb000'),

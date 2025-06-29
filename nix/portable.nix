@@ -1,63 +1,187 @@
 {
-  pkgs ? import <nixpkgs> { },
-  pwndbg ? import ./pwndbg.nix { },
+  pkgs,
+  pwndbg,
+  ...
 }:
 let
+  pkgsNative = pkgs.pkgsBuildHost;
+  lib = pkgs.lib;
+
+  isLLDB = pwndbg.meta.isLLDB;
+  lldb = pwndbg.meta.lldb;
   gdb = pwndbg.meta.gdb;
   python3 = pwndbg.meta.python3;
   pwndbgVenv = pwndbg.meta.pwndbgVenv;
 
-  gdbBundledLib = pkgs.callPackage ./bundle { } "${gdb}/bin/gdb";
-  pyEnvBundledLib = pkgs.callPackage ./bundle { } "${pwndbgVenv}/lib/";
+  bundler = arg: (pkgsNative.callPackage ./bundle { } arg);
 
-  ldName = pkgs.lib.readFile (
-    pkgs.runCommand "bundle" { nativeBuildInputs = [ pkgs.patchelf ]; } ''
-      echo -n $(patchelf --print-interpreter "${gdbBundledLib}/exe/gdb") > $out
+  ldName = lib.readFile (
+    pkgsNative.runCommand "pwndbg-bundle-ld-name-IFD" { nativeBuildInputs = [ pkgsNative.patchelf ]; }
+      ''
+        echo -n $(basename $(patchelf --print-interpreter "${python3}/bin/python3")) > $out
+      ''
+  );
+  ldLoader = if pkgs.stdenv.isLinux then "\"$dir/lib/${ldName}\"" else "";
+
+  commonEnvs =
+    lib.optionalString (pkgs.stdenv.isLinux && isLLDB) ''
+      export LLDB_DEBUGSERVER_PATH="$dir/bin/lldb-server"
     ''
+    + lib.optionalString pkgs.stdenv.isLinux ''
+      export TERMINFO_DIRS=${
+        lib.concatStringsSep ":" [
+          # Fix issue Linux https://github.com/pwndbg/pwndbg/issues/2531
+          "/etc/terminfo" # Debian, Fedora, Gentoo
+          "/lib/terminfo" # Debian
+          "/usr/share/terminfo" # upstream default, probably all FHS-based distros
+          "/run/current-system/sw/share/terminfo" # NixOS
+          "$dir/share/terminfo"
+        ]
+      }
+    ''
+    + lib.optionalString pkgs.stdenv.isDarwin ''
+      export TERMINFO_DIRS=${
+        lib.concatStringsSep ":" [
+          # Fix issue Darwin https://github.com/pwndbg/pwndbg/issues/2531
+          "/usr/share/terminfo" # upstream default, probably all FHS-based distros
+          "$dir/share/terminfo"
+        ]
+      }
+    ''
+    + ''
+      export PYTHONNOUSERSITE=1
+      export PYTHONHOME="$dir"
+      export PYTHONPATH=""
+      export PATH="$dir/bin/:$PATH"
+    '';
+
+  wrapperBinPy =
+    file:
+    pkgs.writeScript "pwndbg-wrapper-bin-py" ''
+      #!/bin/sh
+      dir="$(cd -- "$(dirname "$(dirname "$(realpath "$0")")")" >/dev/null 2>&1 ; pwd -P)"
+      ${commonEnvs}
+      exec -a "$0" ${ldLoader} "$dir/exe/python3" "$dir/${file}" "$@"
+    '';
+  wrapperBin =
+    file:
+    pkgs.writeScript "pwndbg-wrapper-bin" ''
+      #!/bin/sh
+      dir="$(cd -- "$(dirname "$(dirname "$(realpath "$0")")")" >/dev/null 2>&1 ; pwd -P)"
+      ${commonEnvs}
+      exec -a "$0" ${ldLoader} "$dir/${file}" "$@"
+    '';
+
+  pwndbgGdbBundled = bundler (
+    (lib.optionals (pkgs.libffi_portable != null) [
+      "${lib.getLib pkgs.libffi_portable}/lib/"
+      "lib/"
+    ])
+    ++
+      # Darwin don't have gdbserver
+      (lib.optionals (!pkgs.stdenv.isDarwin) [
+        "${lib.getBin gdb}/bin/gdbserver"
+        "exe/gdbserver"
+
+        "${wrapperBin "exe/gdbserver"}"
+        "bin/gdbserver"
+      ])
+    ++ [
+      "${lib.getBin gdb}/bin/gdb"
+      "exe/gdb"
+
+      "${wrapperBin "exe/gdb"}"
+      "bin/gdb"
+
+      "${gdb}/share/gdb/"
+      "share/gdb/"
+
+      "${python3}/bin/python3"
+      "exe/python3"
+
+      "${pwndbgVenv}/lib/"
+      "lib/"
+
+      "${python3}/lib/"
+      "lib/"
+
+      "${pwndbgVenv}/bin/pwndbg"
+      "exe/pwndbg"
+
+      "${wrapperBinPy "exe/pwndbg"}"
+      "bin/pwndbg"
+    ]
   );
 
-  pwndbgBundleBin = pkgs.writeScript "pwndbg" ''
-    #!/bin/sh
-    dir="$(cd -- "$(dirname "$(dirname "$(realpath "$0")")")" >/dev/null 2>&1 ; pwd -P)"
-    export PYTHONHOME="$dir"
-    exec "$dir/lib/${ldName}" "$dir/exe/gdb" --quiet --early-init-eval-command="set auto-load safe-path /" --command=$dir/exe/gdbinit.py "$@"
-  '';
+  pwndbgLldbBundled = bundler (
+    (lib.optionals (pkgs.libffi_portable != null) [
+      "${lib.getLib pkgs.libffi_portable}/lib/"
+      "lib/"
+    ])
+    ++ [
+      "${lib.getBin lldb}/bin/.lldb-wrapped"
+      "exe/lldb"
+
+      "${lib.getBin lldb}/bin/lldb-server"
+      "exe/lldb-server"
+
+      "${lib.getLib lldb}/lib/"
+      "lib/"
+
+      "${pwndbgVenv}/lib/"
+      "lib/"
+
+      "${python3}/lib/"
+      "lib/"
+
+      "${python3}/bin/python3"
+      "exe/python3"
+
+      "${wrapperBin "exe/lldb-server"}"
+      "bin/lldb-server"
+
+      "${wrapperBin "exe/lldb"}"
+      "bin/lldb"
+
+      "${pwndbgVenv}/bin/pwndbg-lldb"
+      "exe/pwndbg-lldb"
+
+      "${wrapperBinPy "exe/pwndbg-lldb"}"
+      "bin/pwndbg-lldb"
+    ]
+  );
+  pwndbgBundled = if isLLDB then pwndbgLldbBundled else pwndbgGdbBundled;
 
   portable =
-    pkgs.runCommand "portable-${pwndbg.name}"
+    pkgsNative.runCommand "portable-${pwndbg.name}"
       {
         meta = {
           name = pwndbg.name;
           version = pwndbg.version;
-          architecture = gdb.stdenv.targetPlatform.system;
+          architecture =
+            if isLLDB then lldb.stdenv.targetPlatform.system else gdb.stdenv.targetPlatform.system;
         };
       }
       ''
-        mkdir -p $out/pwndbg/bin/
-        mkdir -p $out/pwndbg/lib/
-        mkdir -p $out/pwndbg/exe/
-        mkdir -p $out/pwndbg/share/gdb/
-        touch $out/pwndbg/exe/.skip-venv
+        mkdir -p $out/pwndbg/
+        # copy
+        cp -rf ${pwndbgBundled}/* $out/pwndbg/
 
-        cp -rf ${gdbBundledLib}/exe/* $out/pwndbg/exe/
-        cp -rf ${gdbBundledLib}/lib/* $out/pwndbg/lib/
-        cp -rf ${pyEnvBundledLib}/lib/* $out/pwndbg/lib/
-
-        cp -rf ${pwndbgVenv}/share/gdb/* $out/pwndbg/share/gdb/
-        cp -rf ${gdb}/share/gdb/* $out/pwndbg/share/gdb/
+        # writable out
         chmod -R +w $out
 
-        cp -rf ${pwndbg.src}/pwndbg $out/pwndbg/lib/${python3.libPrefix}/site-packages/
-        cp ${pwndbg.src}/gdbinit.py $out/pwndbg/exe/
+        # copy extra files
+        mkdir -p $out/pwndbg/share/
+        cp -rf ${lib.getLib pkgs.ncurses}/share/terminfo/ $out/pwndbg/share/
 
-        cp ${pwndbgBundleBin} $out/pwndbg/bin/pwndbg
+        # fix ipython autocomplete
+        cp -rf ${pwndbgVenv}/lib/${python3.libPrefix}/site-packages/parso/python/*.txt $out/pwndbg/lib/${python3.libPrefix}/site-packages/parso/python/
 
         # fix python "subprocess.py" to use "/bin/sh" and not the nix'ed version, otherwise "gdb-pt-dump" is broken
-        substituteInPlace $out/pwndbg/lib/${python3.libPrefix}/subprocess.py --replace "'${pkgs.bash}/bin/sh'" "'/bin/sh'"
+        sed -i 's@/nix/store/.*/bin/sh@/bin/sh@' $out/pwndbg/lib/${python3.libPrefix}/subprocess.py
 
         # build pycache
-        chmod -R +w $out/pwndbg/lib/${python3.libPrefix}/site-packages/pwndbg
-        SOURCE_DATE_EPOCH=0 ${pwndbgVenv}/bin/python3 -c "import compileall; compileall.compile_dir('$out', stripdir='$out', force=True);"
+        SOURCE_DATE_EPOCH=0 ${pkgsNative.python3}/bin/python3 -c "import compileall; compileall.compile_dir('$out', stripdir='$out', force=True);"
       '';
 in
 portable

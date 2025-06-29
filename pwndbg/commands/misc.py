@@ -4,14 +4,15 @@ import argparse
 import errno
 from collections import defaultdict
 
-import gdb
-
+import pwndbg.aglib.memory
+import pwndbg.aglib.regs
+import pwndbg.aglib.symbol
+import pwndbg.aglib.vmmap
 import pwndbg.color as C
+import pwndbg.color.message as message
 import pwndbg.commands
-import pwndbg.gdblib.regs
-import pwndbg.gdblib.symbol
+import pwndbg.dbg
 from pwndbg.commands import CommandCategory
-from pwndbg.gdblib.scheduler import parse_and_eval_with_scheduler_lock
 
 # Manually add error code 0 for "OK"
 errno.errorcode[0] = "OK"  # type: ignore[index]
@@ -28,50 +29,54 @@ parser.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(parser, command_name="errno", category=CommandCategory.LINUX)
+def _get_errno() -> int:
+    # Try to get the `errno` variable value
+    # if it does not exist, get the errno variable from its location
+    try:
+        return int(pwndbg.dbg.selected_frame().evaluate_expression("errno"))
+    except pwndbg.dbg_mod.Error:
+        pass
+
+    # We can't simply call __errno_location because its .plt.got entry may be uninitialized
+    # (e.g. if the binary was just started with `starti` command)
+    # So we have to check the got.plt entry first before calling it
+    errno_loc_gotplt = pwndbg.aglib.symbol.lookup_symbol_addr("__errno_location@got.plt")
+    if errno_loc_gotplt is not None:
+        page_loaded = pwndbg.aglib.vmmap.find(
+            pwndbg.aglib.memory.read_pointer_width(errno_loc_gotplt)
+        )
+        if page_loaded is None:
+            raise pwndbg.dbg_mod.Error(
+                "Could not determine error code automatically: the __errno_location@got.plt has no valid address yet (perhaps libc.so hasn't been loaded yet?)"
+            )
+
+    try:
+        return int(
+            pwndbg.dbg.selected_frame().evaluate_expression(
+                "*((int *(*) (void)) __errno_location) ()", lock_scheduler=True
+            )
+        )
+    except pwndbg.dbg_mod.Error as e:
+        raise pwndbg.dbg_mod.Error(
+            "Could not determine error code automatically: neither `errno` nor `__errno_location` symbols were provided (perhaps libc.so hasn't been not loaded yet?)"
+        ) from e
+
+
+@pwndbg.commands.Command(parser, command_name="errno", category=CommandCategory.LINUX)
 @pwndbg.commands.OnlyWhenRunning
 def errno_(err) -> None:
     if err is None:
-        # Try to get the `errno` variable value
-        # if it does not exist, get the errno variable from its location
         try:
-            err = int(gdb.parse_and_eval("errno"))
-        except gdb.error:
-            try:
-                # We can't simply call __errno_location because its .plt.got entry may be uninitialized
-                # (e.g. if the binary was just started with `starti` command)
-                # So we have to check the got.plt entry first before calling it
-                errno_loc_gotplt = pwndbg.gdblib.symbol.address("__errno_location@got.plt")
-
-                # If the got.plt entry is not there (is None), it means the symbol is not used by the binary
-                if errno_loc_gotplt is None or pwndbg.gdblib.vmmap.find(
-                    pwndbg.gdblib.memory.pvoid(errno_loc_gotplt)
-                ):
-                    err = int(
-                        parse_and_eval_with_scheduler_lock(
-                            "*((int *(*) (void)) __errno_location) ()"
-                        )
-                    )
-                else:
-                    print(
-                        "Could not determine error code automatically: the __errno_location@got.plt has no valid address yet (perhaps libc.so hasn't been loaded yet?)"
-                    )
-                    return
-            except gdb.error:
-                print(
-                    "Could not determine error code automatically: neither `errno` nor `__errno_location` symbols were provided (perhaps libc.so hasn't been not loaded yet?)"
-                )
-                return
+            err = _get_errno()
+        except pwndbg.dbg_mod.Error as e:
+            print(str(e))
+            return
 
     msg = errno.errorcode.get(int(err), "Unknown error code")
     print(f"Errno {err}: {msg}")
 
 
-parser = argparse.ArgumentParser(description="Prints out a list of all pwndbg commands.")
-
-group = parser.add_mutually_exclusive_group()
-group.add_argument("--shell", action="store_true", help="Only display shell commands")
-group.add_argument("--all", dest="all_", action="store_true", help="Only display shell commands")
+parser = argparse.ArgumentParser(description="Prints out a list of all Pwndbg commands.")
 
 cat_group = parser.add_mutually_exclusive_group()
 cat_group.add_argument(
@@ -90,29 +95,17 @@ parser.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(parser, command_name="pwndbg", category=CommandCategory.PWNDBG)
-def pwndbg_(filter_pattern, shell, all_, category_, list_categories) -> None:
+@pwndbg.commands.Command(parser, command_name="pwndbg", category=CommandCategory.PWNDBG)
+def pwndbg_(filter_pattern, category_, list_categories) -> None:
     if list_categories:
         for category in CommandCategory:
             print(C.bold(C.green(f"{category.value}")))
         return
 
-    if all_:
-        shell_cmds = True
-        pwndbg_cmds = True
-    elif shell:
-        shell_cmds = True
-        pwndbg_cmds = False
-    else:
-        shell_cmds = False
-        pwndbg_cmds = True
-
     from tabulate import tabulate
 
     table_data = defaultdict(list)
-    for name, aliases, category, docs in list_and_filter_commands(
-        filter_pattern, pwndbg_cmds, shell_cmds
-    ):
+    for name, aliases, category, docs in list_and_filter_commands(filter_pattern):
         alias_str = ""
         if aliases:
             aliases = map(C.blue, aliases)
@@ -135,10 +128,11 @@ def pwndbg_(filter_pattern, shell, all_, category_, list_categories) -> None:
         )
         print()
 
+    print(message.info("Also check out convenience functions with `help function`!"))
 
-def list_and_filter_commands(filter_str, pwndbg_cmds=True, shell_cmds=False):
-    sorted_commands = list(pwndbg.commands.commands)
-    sorted_commands.sort(key=lambda x: x.__name__)
+
+def list_and_filter_commands(filter_str):
+    sorted_commands = sorted(pwndbg.commands.commands, key=lambda c: c.command_name)
 
     if filter_str:
         filter_str = filter_str.lower()
@@ -146,27 +140,13 @@ def list_and_filter_commands(filter_str, pwndbg_cmds=True, shell_cmds=False):
     results = []
 
     for c in sorted_commands:
-        # If this is a shell command and we didn't ask for shell commands, skip it
-        if c.shell and not shell_cmds:
-            continue
+        name = c.command_name
+        desc = c.description
 
-        # If this is a normal command and we didn't ask for normal commands, skip it
-        if not c.shell and not pwndbg_cmds:
-            continue
+        assert desc
+        desc = desc.splitlines()[0]
 
-        # Don't print aliases
-        if c.is_alias:
-            continue
-
-        name = c.__name__
-        docs = c.__doc__
-
-        if docs:
-            docs = docs.strip()
-        if docs:
-            docs = docs.splitlines()[0]
-
-        if not filter_str or filter_str in name.lower() or (docs and filter_str in docs.lower()):
-            results.append((name, c.aliases, c.category, docs))
+        if not filter_str or filter_str in name.lower() or (desc and filter_str in desc.lower()):
+            results.append((name, c.aliases, c.category, desc))
 
     return results

@@ -24,21 +24,12 @@ c = ColorConfig(
 )
 
 
-def sym_name(address: int) -> str | None:
-    """
-    Retrieves the name of the symbol at the given address, if it exists
-    """
-    import pwndbg
-
-    return pwndbg.dbg.selected_inferior().symbol_name_at_address(address)
-
-
 def get_address_and_symbol(address: int) -> str:
     """
     Convert and colorize address 0x7ffff7fcecd0 to string `0x7ffff7fcecd0 (_dl_fini)`
     If no symbol exists for the address, return colorized address
     """
-    symbol = sym_name(address)
+    symbol = pwndbg.aglib.symbol.resolve_addr(address)
     if symbol:
         symbol = f"{address:#x} ({symbol})"
     else:
@@ -61,7 +52,7 @@ def attempt_colorized_symbol(address: int) -> str | None:
     """
     Convert address to colorized symbol (if symbol is there), else None
     """
-    symbol = sym_name(address)
+    symbol = pwndbg.aglib.symbol.resolve_addr(address)
     if symbol:
         return get(address, symbol)
     else:
@@ -84,9 +75,9 @@ def get(
     Returns a colorized string representing the provided address.
 
     Arguments:
-        address(int | pwndbg.dbg_mod.Value): Address to look up
-        text(str | None): Optional text to use in place of the address in the return value string.
-        prefix(str | None): Optional text to set at beginning in the return value string.
+        address: Address to look up
+        text: Optional text to use in place of the address in the return value string.
+        prefix: Optional text to set at beginning in the return value string.
     """
     address = int(address)
     page = pwndbg.aglib.vmmap.find(address)
@@ -97,10 +88,12 @@ def get(
         color = normal
     elif "[stack" in page.objfile:
         color = c.stack
-    elif "[heap" in page.objfile:
-        color = c.heap
     elif page.execute:
         color = c.code
+    elif not page.write:
+        color = c.rodata
+    elif any(keyword in page.objfile for keyword in ("[heap", "physmap", "vmalloc")):
+        color = c.heap
     elif page.rw:
         color = c.data
     elif page.is_guard:

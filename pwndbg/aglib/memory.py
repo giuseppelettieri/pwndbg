@@ -8,6 +8,7 @@ import pwndbg.aglib.arch
 import pwndbg.aglib.typeinfo
 import pwndbg.lib.cache
 import pwndbg.lib.memory
+from pwndbg.dbg import EventType
 from pwndbg.dbg import TypeCode
 from pwndbg.lib.memory import PAGE_SIZE
 
@@ -23,12 +24,12 @@ def read(addr: int, count: int, partial: bool = False) -> bytearray:
     Read memory from the program being debugged.
 
     Arguments:
-        addr(int): Address to read
-        count(int): Number of bytes to read
-        partial(bool): Whether less than ``count`` bytes can be returned
+        addr: Address to read
+        count: Number of bytes to read
+        partial: Whether less than ``count`` bytes can be returned
 
     Returns:
-        :class:`bytearray`: The memory at the specified address,
+        `bytearray` The memory at the specified address,
         or ``None``.
     """
     return pwndbg.dbg.selected_inferior().read_memory(address=addr, size=count, partial=partial)
@@ -41,11 +42,11 @@ def readtype(type: pwndbg.dbg_mod.Type, addr: int) -> int:
     native integer representation of the same.
 
     Arguments:
-        type(pwndbg.dbg_mod.Type): GDB type to read
-        addr(int): Address at which the value to be read resides
+        type: GDB type to read
+        addr: Address at which the value to be read resides
 
     Returns:
-        :class:`int`
+        `int`
     """
     return int(get_typed_pointer_value(type, addr))
 
@@ -56,8 +57,8 @@ def write(addr: int, data: str | bytes | bytearray) -> None:
     Writes data into the memory of the process being debugged.
 
     Arguments:
-        addr(int): Address to write
-        data(str,bytes,bytearray): Data to write
+        addr: Address to write
+        data: Data to write
     """
     if isinstance(data, str):
         data = bytes(data, "utf8")
@@ -71,10 +72,10 @@ def peek(address: int) -> bytearray | None:
     Read one byte from the specified address.
 
     Arguments:
-        address(int): Address to read
+        address: Address to read
 
     Returns:
-        :class:`bytearray`: A single byte of data, or ``None`` if the
+        `bytearray` A single byte of data, or ``None`` if the
         address cannot be read.
     """
     try:
@@ -91,10 +92,10 @@ def is_readable_address(address: int) -> bool:
     Check if the address can be read by GDB.
 
     Arguments:
-        address(int): Address to read
+        address: Address to read
 
     Returns:
-        :class:`bool`: Whether the address is readable.
+        `bool`: Whether the address is readable.
     """
     # We use vmmap to check before `peek()` because accessing memory for embedded targets might be slow and expensive.
     return pwndbg.aglib.vmmap.find(address) is not None and peek(address) is not None
@@ -106,18 +107,26 @@ def poke(address: int) -> bool:
     Checks whether an address is writable.
 
     Arguments:
-        address(int): Address to check
+        address: Address to check
 
     Returns:
-        :class:`bool`: Whether the address is writable.
+        `bool`: Whether the address is writable.
     """
     c = peek(address)
     if c is None:
         return False
     try:
+        # Suspending mem_changed event during poke speeds up things when vmmaps are explored
+        # (e.g. when stepping through remote processes run with QEMU)
+        # The suspension prevents the clearing of the disasm instruction cache
+        # by `aglib.disasm.clear_on_reg_mem_change`
+        pwndbg.dbg.suspend_events(EventType.MEMORY_CHANGED)
         write(address, c)
     except Exception:
         return False
+    finally:
+        pwndbg.dbg.resume_events(EventType.MEMORY_CHANGED)
+
     return True
 
 
@@ -125,8 +134,8 @@ def string(addr: int, max: int = 4096) -> bytearray:
     """Reads a null-terminated string from memory.
 
     Arguments:
-        addr(int): Address to read from
-        max(int): Maximum string length (default 4096)
+        addr: Address to read from
+        max: Maximum string length (default 4096)
 
     Returns:
         An empty bytearray, or a NULL-terminated bytearray.
@@ -174,12 +183,14 @@ def uint(addr: int) -> int:
     return readtype(pwndbg.aglib.typeinfo.uint, addr)
 
 
-def pvoid(addr: int) -> int:
-    """pvoid(addr) -> int
-
-    Read one pointer from the specified address.
+def read_pointer_width(addr: int) -> int:
     """
-    return readtype(pwndbg.aglib.typeinfo.pvoid, addr)
+    Read one pointer-width integer at the specified address.
+
+    Raises:
+        pwndbg.dbg_mod.Error: if memory read fails.
+    """
+    return pwndbg.aglib.arch.unpack(read(addr, pwndbg.aglib.arch.ptrsize))
 
 
 def u8(addr: int) -> int:
@@ -256,6 +267,14 @@ def s64(addr: int) -> int:
     Read one ``int64_t`` from the specified address.
     """
     return readtype(pwndbg.aglib.typeinfo.int64, addr)
+
+
+def sint(addr: int) -> int:
+    """
+    Read one `signed int` from the specified
+    address.
+    """
+    return readtype(pwndbg.aglib.typeinfo.sint, addr)
 
 
 def cast_pointer(
@@ -343,6 +362,16 @@ def update_min_addr() -> None:
     MMAP_MIN_ADDR = 0 if pwndbg.aglib.qemu.is_qemu_kernel() else 0x8000
 
 
+def fetch_struct_as_dictionary(
+    struct_name: str,
+    struct_address: int | pwndbg.dbg_mod.Value,
+    include_only_fields: Set[str] | None = None,
+    exclude_fields: Set[str] | None = None,
+) -> GdbDict:
+    fetched_struct = get_typed_pointer_value("struct " + struct_name, struct_address)
+    return pack_struct_into_dictionary(fetched_struct, include_only_fields, exclude_fields)
+
+
 def pack_struct_into_dictionary(
     fetched_struct: pwndbg.dbg_mod.Value,
     include_only_fields: Set[str] | None = None,
@@ -395,3 +424,20 @@ def resolve_renamed_struct_field(struct_name: str, possible_field_names: Set[str
             return field_name
 
     raise ValueError(f"Field name did not match any of {possible_field_names}.")
+
+
+@pwndbg.lib.cache.cache_until("start", "objfile")
+def is_pagefault_supported() -> bool:
+    """
+    This function should be called before stray memory dereferences to protect against the following situations:
+
+    1. On embedded systems, it's not uncommon for MMIO regions to exist where memory reads might mutate the hardware/process state.
+    2. On baremetal/embedded, paging doesn't always exist, so all memory is "valid" (and often initialized to zero) - this makes every value appear to be a pointer.
+
+    As such, we disable dereferencing by default for bare metal targets.
+
+    See more discussion here: https://github.com/pwndbg/pwndbg/pull/385
+    """
+
+    # TODO: use a better detection method
+    return pwndbg.dbg.selected_inferior().is_linux()
